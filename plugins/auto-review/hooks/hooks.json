@@ -1,0 +1,29 @@
+{
+  "description": "Auto Review hooks: opt-in UserPromptSubmit arming and Stop-driven review/fix loop",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import os,runpy,sys; roots=[os.environ.get('CODEX_PLUGIN_ROOT'),os.environ.get('CLAUDE_PLUGIN_ROOT'),os.getcwd(),os.path.join(os.getcwd(),'plugins','auto-review')]; script=next((os.path.join(r,'hooks','auto_review_hook.py') for r in roots if r and os.path.exists(os.path.join(r,'hooks','auto_review_hook.py'))),None); sys.exit(0) if script is None else runpy.run_path(script, run_name='__main__')\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import os,runpy,sys; roots=[os.environ.get('CODEX_PLUGIN_ROOT'),os.environ.get('CLAUDE_PLUGIN_ROOT'),os.getcwd(),os.path.join(os.getcwd(),'plugins','auto-review')]; script=next((os.path.join(r,'hooks','auto_review_hook.py') for r in roots if r and os.path.exists(os.path.join(r,'hooks','auto_review_hook.py'))),None); sys.exit(0) if script is None else runpy.run_path(script, run_name='__main__')\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

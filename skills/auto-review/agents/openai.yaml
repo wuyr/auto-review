@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auto Review"
+  short_description: "Automatically review and repair Codex task changes after Stop."
+  default_prompt: "Use $auto-review for this task."

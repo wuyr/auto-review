@@ -1,0 +1,20 @@
+{
+  "name": "auto-review-local",
+  "interface": {
+    "displayName": "Auto Review Local"
+  },
+  "plugins": [
+    {
+      "name": "auto-review",
+      "source": {
+        "source": "local",
+        "path": "./plugins/auto-review"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
