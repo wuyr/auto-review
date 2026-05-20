@@ -94,6 +94,9 @@ class AutoReviewHookTest(unittest.TestCase):
         self.assertEqual(block["decision"], "block")
         self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
         self.assertIn(REVIEW_SENTINEL, block["reason"])
+        self.assertNotIn("systemMessage", block)
+        self.assertNotIn("\n", block["reason"])
+        self.assertLess(len(block["reason"]), 700)
         return block
 
     def test_activation_arms_and_first_stop_emits_review(self) -> None:
@@ -338,6 +341,9 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertTrue(block["reason"].startswith(FIX_PROMPT))
             self.assertIn(FIX_SENTINEL, block["reason"])
             self.assertIn("遗漏空状态", block["reason"])
+            self.assertNotIn("systemMessage", block)
+            self.assertNotIn("\n", block["reason"])
+            self.assertNotIn("```json", block["reason"])
             state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "fixing")
             self.assertEqual(state["fix_count"], 1)

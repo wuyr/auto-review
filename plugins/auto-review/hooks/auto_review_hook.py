@@ -411,50 +411,36 @@ def parse_review_result(text: str) -> tuple[bool, list[dict[str, Any]]] | None:
 
 
 def review_prompt(review_count: int) -> str:
-    return f"""{REVIEW_PROMPT}
-
-{REVIEW_SENTINEL}
-
-你正在执行 auto-review 的自动 review 阶段。这是第 {review_count} 次 review。
-只 review 本次任务中产生的修改，重点检查遗漏、逻辑错误、回归风险、测试缺口。
-如果发现真实问题，先用简洁中文列出问题和证据；如果没有问题，明确说明未发现阻塞问题。
-
-最后必须输出一个机器可解析结果块：
-<auto_review_result>
-{{"issues_found":true,"issues":[{{"summary":"问题摘要","evidence":"文件/行为证据","fix_hint":"修复建议"}}]}}
-</auto_review_result>
-
-没有问题时输出：
-<auto_review_result>
-{{"issues_found":false,"issues":[]}}
-</auto_review_result>
-
-不要把格式问题、风格偏好或未证实猜测标记为 issues_found=true。"""
+    issue_result = (
+        '<auto_review_result>{"issues_found":true,"issues":[{"summary":"问题摘要",'
+        '"evidence":"文件/行为证据","fix_hint":"修复建议"}]}</auto_review_result>'
+    )
+    clean_result = '<auto_review_result>{"issues_found":false,"issues":[]}</auto_review_result>'
+    return (
+        f"{REVIEW_PROMPT} {REVIEW_SENTINEL} "
+        f"第 {review_count} 次 auto-review：只审本次任务修改，重点查遗漏、逻辑错误、回归风险、测试缺口；"
+        "发现真实问题时先简洁列出问题和证据，无问题则说明未发现阻塞问题；"
+        f"最后必须输出机器可解析结果块：有问题用 {issue_result}，无问题用 {clean_result}；"
+        "不要把格式问题、风格偏好或未证实猜测标记为 issues_found=true。"
+    )
 
 
 def fix_prompt(issues: list[dict[str, Any]], fix_count: int) -> str:
-    issues_json = json.dumps(issues, ensure_ascii=False, indent=2)
-    return f"""{FIX_PROMPT}
-
-{FIX_SENTINEL}
-
-这是第 {fix_count} 次自动修复。以下是上一轮 review 发现的真实问题 JSON：
-
-```json
-{issues_json}
-```
-
-请修复这些问题。修复完成后正常结束本轮；auto-review 会在 Stop hook 中自动提交下一轮 review prompt。
-不要手动提交 review prompt，也不要输出 <auto_review_result>，除非你正在执行 review 阶段。"""
+    issues_json = json.dumps(issues, ensure_ascii=False, separators=(",", ":"))
+    return (
+        f"{FIX_PROMPT} {FIX_SENTINEL} "
+        f"第 {fix_count} 次自动修复。上一轮 review 发现的真实问题 JSON：{issues_json}。"
+        "请修复这些问题，完成后正常结束本轮；auto-review 会自动提交下一轮 review prompt。"
+        "不要手动提交 review prompt，也不要输出 <auto_review_result>，除非你正在执行 review 阶段。"
+    )
 
 
-def emit_block(prompt: str, system_message: str) -> None:
+def emit_block(prompt: str) -> None:
     print(
         json.dumps(
             {
                 "decision": "block",
                 "reason": prompt,
-                "systemMessage": system_message,
             },
             ensure_ascii=False,
         )
@@ -624,10 +610,7 @@ def transition_to_review(payload: dict[str, Any], state: dict[str, Any], source:
             "source": source,
         }
     )
-    emit_block(
-        review_prompt(review_count),
-        f"auto-review: running review pass {review_count}; finish with <auto_review_result> JSON.",
-    )
+    emit_block(review_prompt(review_count))
     return 0
 
 
@@ -674,10 +657,7 @@ def handle_review_stop(payload: dict[str, Any], state: dict[str, Any]) -> int:
             "issue_count": len(issues),
         }
     )
-    emit_block(
-        fix_prompt(issues, fix_count),
-        f"auto-review: fixing {len(issues)} issue(s); Stop will trigger another review.",
-    )
+    emit_block(fix_prompt(issues, fix_count))
     return 0
 
 
