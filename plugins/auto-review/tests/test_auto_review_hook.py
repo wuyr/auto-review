@@ -45,6 +45,44 @@ class AutoReviewHookTest(unittest.TestCase):
         path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
         return path
 
+    def write_transcript(self, root: Path, records: list[dict]) -> Path:
+        path = root / "transcript.jsonl"
+        path.write_text(
+            "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return path
+
+    def goal_context_record(self, objective: str) -> dict:
+        return {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "<goal_context>\n"
+                            "Continue working toward the active thread goal.\n"
+                            f"<objective>\n{objective}\n</objective>\n"
+                            "</goal_context>"
+                        ),
+                    }
+                ],
+            },
+        }
+
+    def goal_complete_record(self, status: str = "complete") -> dict:
+        return {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_goal",
+                "output": json.dumps({"goal": {"status": status}}, ensure_ascii=False),
+            },
+        }
+
     def state_file(self, state_home: Path, session_id: str = "session-1") -> Path:
         return state_home / "state" / f"{session_id}.json"
 
@@ -294,6 +332,382 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertEqual(events[-2]["event"], "plan_deferred_adopted")
             self.assertEqual(events[-1]["event"], "review_prompt")
             self.assertEqual(events[-1]["source"], "plan_implementation_stop")
+
+    def test_goal_completion_late_arms_and_emits_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("实现这个目标，结束后主动触发 $auto-review。"),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "call_skill_read",
+                            "output": (
+                                "Skill docs mention <auto_review_result>{}</auto_review_result> "
+                                "but this is not an automatic review run."
+                            ),
+                        },
+                    },
+                    self.goal_complete_record("complete"),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "目标已完成。"}],
+                        },
+                    },
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            self.assertIn(REVIEW_SENTINEL, block["reason"])
+
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "reviewing")
+            self.assertEqual(state["review_count"], 1)
+            self.assertEqual(state["last_transition"], "goal_complete_stop")
+            self.assertEqual(state["activation_source"], "goal_complete")
+
+            events = self.history_events(state_home)
+            self.assertEqual(events[-2]["event"], "goal_armed_late")
+            self.assertEqual(events[-1]["event"], "review_prompt")
+            self.assertEqual(events[-1]["source"], "goal_complete_stop")
+
+    def test_goal_completion_without_auto_review_request_does_not_emit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("实现这个目标。"),
+                    self.goal_complete_record("complete"),
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+
+    def test_goal_auto_review_waits_until_goal_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("实现这个目标，结束后主动触发 $auto-review。"),
+                    self.goal_complete_record("active"),
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+
+    def test_goal_command_prompt_does_not_arm_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "/goal $auto-review 实现这个目标，完成后自动 review。"
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("实现这个目标，完成后自动触发 $auto-review。"),
+                    self.goal_complete_record("active"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("实现这个目标，完成后自动触发 $auto-review。"),
+                    self.goal_complete_record("complete"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+
+    def test_goal_command_prompt_clears_deferred_plan_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.transcript(state_home, PROPOSED_PLAN)
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertTrue(self.state_file(state_home).exists())
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "/goal $auto-review 实现新的目标，完成后自动 review。"
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+            self.assertEqual(self.handoff_files(state_home), [])
+
+    def test_goal_active_waits_even_with_deferred_plan_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.transcript(state_home, PROPOSED_PLAN)
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("$auto-review 实现新的 goal。"),
+                    self.goal_complete_record("active"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "deferred_after_plan")
+
+    def test_goal_completion_takes_precedence_over_plan_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.transcript(state_home, PROPOSED_PLAN)
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("$auto-review 实现新的 goal。"),
+                    self.goal_complete_record("complete"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home, session_id="session-2")
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            state = json.loads(self.state_file(state_home, "session-2").read_text(encoding="utf-8"))
+            self.assertEqual(state["last_transition"], "goal_complete_stop")
+            self.assertEqual(state["activation_source"], "goal_complete")
+            self.assertFalse(self.state_file(state_home, "session-1").exists())
+            self.assertEqual(self.handoff_files(state_home), [])
+
+    def test_goal_active_takes_precedence_over_plan_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.transcript(state_home, PROPOSED_PLAN)
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("$auto-review 实现新的 goal。"),
+                    self.goal_complete_record("active"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home, session_id="session-2")
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home, "session-2").exists())
+            self.assertTrue(self.state_file(state_home, "session-1").exists())
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+    def test_goal_objective_prompt_state_waits_until_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "$auto-review 实现这个 goal objective。"
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto_review_armed", result.stdout)
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("$auto-review 实现这个 goal objective。"),
+                    self.goal_complete_record("active"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "armed")
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("$auto-review 实现这个 goal objective。"),
+                    self.goal_complete_record("complete"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "reviewing")
+            self.assertEqual(state["last_transition"], "goal_complete_stop")
+            self.assertEqual(state["activation_source"], "goal_complete")
+
+    def test_goal_auto_review_does_not_rearm_after_existing_review_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("实现这个目标，结束后主动触发 $auto-review。"),
+                    self.goal_complete_record("complete"),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": REVIEW_SENTINEL}],
+                        },
+                    },
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+
+    def test_goal_auto_review_ignores_review_activity_before_latest_goal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": REVIEW_SENTINEL}],
+                        },
+                    },
+                    self.goal_context_record("实现新的目标，结束后主动触发 $auto-review。"),
+                    self.goal_complete_record("complete"),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "目标已完成。"}],
+                        },
+                    },
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            self.assertIn(REVIEW_SENTINEL, block["reason"])
+
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "reviewing")
+            self.assertEqual(state["last_transition"], "goal_complete_stop")
+
+    def test_goal_auto_review_does_not_replay_on_later_user_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("实现这个目标，结束后主动触发 $auto-review。"),
+                    self.goal_complete_record("complete"),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "目标已完成。"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "解释一下刚才的结果。"}],
+                        },
+                    },
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
 
     def test_auto_submitted_prompt_does_not_arm_again(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -26,6 +26,14 @@ $auto-review 为这个需求制定计划：...
 
 When `/plan` returns a final response containing `<proposed_plan>`, the hook defers review instead of reviewing the plan itself. After the user clicks “实现计划”, clicks “清除当前上下文然后实现计划”, or otherwise asks to implement the plan, the hook runs auto-review when that implementation phase stops. If clearing context creates a new session, the hook can continue the deferred plan through a cwd-scoped handoff. If the user submits an unrelated ordinary prompt while review is deferred after a plan, the hook cancels the deferred state.
 
+For `/goal` workflows, include `$auto-review` in the goal objective:
+
+```text
+/goal $auto-review 完成这个目标，完成后自动 review
+```
+
+The hook does not review intermediate goal-continuation turns. When the goal is marked `complete`, the Stop hook reads the goal objective from the transcript and starts the review loop once.
+
 At Stop, the hook will submit this review prompt:
 
 ```text

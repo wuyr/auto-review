@@ -22,6 +22,12 @@ RESULT_RE = re.compile(
     re.DOTALL,
 )
 PROPOSED_PLAN_RE = re.compile(r"<\s*proposed_plan(?:\s[^>]*)?>", re.IGNORECASE)
+GOAL_CONTEXT_RE = re.compile(r"<\s*goal_context(?:\s[^>]*)?>", re.IGNORECASE)
+GOAL_COMMAND_RE = re.compile(r"^\s*/goal(?:\s|$)", re.IGNORECASE)
+GOAL_OBJECTIVE_RE = re.compile(
+    r"<\s*(?:objective|untrusted_objective)\s*>(.*?)</\s*(?:objective|untrusted_objective)\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
 STATE_TTL_SECONDS = 12 * 60 * 60
 
 
@@ -281,6 +287,11 @@ def is_proposed_plan_output(text: str) -> bool:
     return bool(PROPOSED_PLAN_RE.search(text or ""))
 
 
+def is_goal_workflow_prompt(prompt: str) -> bool:
+    text = prompt or ""
+    return bool(GOAL_COMMAND_RE.search(text) or GOAL_CONTEXT_RE.search(text))
+
+
 def looks_like_plan_implementation_intent(prompt: str) -> bool:
     text = re.sub(r"\s+", " ", prompt or "").strip().lower()
     if not text:
@@ -335,6 +346,84 @@ def assistant_text_from_record(record: dict[str, Any]) -> str:
     return ""
 
 
+def text_from_record(record: dict[str, Any]) -> str:
+    values: list[str] = []
+    direct = text_from_value(record.get("content"))
+    if direct:
+        values.append(direct)
+
+    message = record.get("message")
+    if isinstance(message, dict):
+        text = text_from_value(message.get("content"))
+        if text:
+            values.append(text)
+
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        for key in ("content", "message", "last_agent_message", "last_assistant_message"):
+            text = text_from_value(payload.get(key))
+            if text:
+                values.append(text)
+        output = payload.get("output")
+        if isinstance(output, str) and output:
+            values.append(output)
+
+    if not values:
+        return ""
+    return "\n".join(dict.fromkeys(values))
+
+
+def transcript_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    transcript_path = payload.get("transcript_path")
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return []
+    path = Path(transcript_path)
+    if not path.exists():
+        return []
+
+    records: list[dict[str, Any]] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        return []
+    return records
+
+
+def record_role(record: dict[str, Any]) -> str:
+    message = record.get("message")
+    if isinstance(message, dict) and isinstance(message.get("role"), str):
+        return message["role"]
+
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        payload_message = payload.get("message")
+        if isinstance(payload_message, dict) and isinstance(payload_message.get("role"), str):
+            return payload_message["role"]
+        if isinstance(payload.get("role"), str):
+            return payload["role"]
+
+    if isinstance(record.get("role"), str):
+        return record["role"]
+    return ""
+
+
+def is_user_supplied_record(record: dict[str, Any]) -> bool:
+    payload = record.get("payload")
+    if isinstance(payload, dict) and payload.get("type") == "user_message":
+        return True
+    return record_role(record) == "user"
+
+
 def last_assistant_text(payload: dict[str, Any]) -> str:
     direct = text_from_value(payload.get("last_assistant_message"))
     if direct:
@@ -369,6 +458,84 @@ def last_assistant_text(payload: dict[str, Any]) -> str:
     except OSError:
         return ""
     return last_text
+
+
+def goal_objectives_from_text(text: str) -> list[str]:
+    objectives: list[str] = []
+    if not GOAL_CONTEXT_RE.search(text or ""):
+        return objectives
+    for match in GOAL_OBJECTIVE_RE.finditer(text):
+        objective = match.group(1).strip()
+        if objective:
+            objectives.append(objective)
+    return objectives
+
+
+def goal_completion_index(records: list[dict[str, Any]]) -> int:
+    completed_index = -1
+    for index, record in enumerate(records):
+        record_payload = record.get("payload")
+        if not isinstance(record_payload, dict):
+            continue
+        if record_payload.get("type") != "function_call_output":
+            continue
+        output = record_payload.get("output")
+        if not isinstance(output, str) or not output.strip():
+            continue
+        try:
+            value = json.loads(output)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        goal = value.get("goal")
+        if isinstance(goal, dict) and goal.get("status") == "complete":
+            completed_index = index
+    return completed_index
+
+
+def goal_auto_review_request_for_completed_goal(payload: dict[str, Any]) -> tuple[bool, str, int]:
+    records = transcript_records(payload)
+    completed_index = goal_completion_index(records)
+    if completed_index < 0:
+        return False, "", -1
+
+    for record in records[completed_index + 1 :]:
+        if is_user_supplied_record(record):
+            return False, "", completed_index
+
+    for record in reversed(records[: completed_index + 1]):
+        objectives = goal_objectives_from_text(text_from_record(record))
+        if not objectives:
+            continue
+        objective = objectives[-1]
+        return (True, objective, completed_index) if should_arm(objective) else (
+            False,
+            "",
+            completed_index,
+        )
+    return False, "", completed_index
+
+
+def latest_goal_auto_review_request(payload: dict[str, Any]) -> tuple[bool, str]:
+    records = transcript_records(payload)
+    for record in reversed(records):
+        objectives = goal_objectives_from_text(text_from_record(record))
+        if not objectives:
+            continue
+        objective = objectives[-1]
+        return (True, objective) if should_arm(objective) else (False, "")
+    return False, ""
+
+
+def transcript_has_auto_review_activity(payload: dict[str, Any], start_index: int = 0) -> bool:
+    needles = (REVIEW_SENTINEL, FIX_SENTINEL)
+    records = transcript_records(payload)
+    for record in records[max(0, start_index) :]:
+        text = text_from_record(record)
+        if any(needle in text for needle in needles):
+            return True
+    return False
 
 
 def parse_review_result(text: str) -> tuple[bool, list[dict[str, Any]]] | None:
@@ -453,7 +620,7 @@ def adopt_plan_handoff(payload: dict[str, Any], handoff: dict[str, Any]) -> dict
     state["phase"] = "deferred_after_plan"
     state["adopted_from_state"] = origin_state
     save_state(payload, state)
-    cleanup_plan_handoff(payload)
+    cleanup_plan_handoff(payload, cleanup_origin_state=True)
     if origin_state and origin_state != state_key(payload):
         cleanup_state_key(origin_state)
     append_history(
@@ -541,7 +708,28 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
         )
         return 0
 
-    if not should_arm(prompt):
+    arm_requested = should_arm(prompt)
+    if arm_requested and is_goal_workflow_prompt(prompt):
+        state = load_state(payload)
+        handoff = load_plan_handoff(payload)
+        if state is not None and state.get("phase") == "deferred_after_plan":
+            cancel_deferred_plan(payload, prompt, state=state, handoff=handoff)
+        elif handoff is not None:
+            cancel_deferred_plan(payload, prompt, handoff=handoff)
+        elif state is not None:
+            cleanup_state(payload)
+            cleanup_plan_handoff(payload, cleanup_origin_state=True)
+        append_debug(
+            {
+                "event": "goal_prompt_deferred_until_complete",
+                "state": state_key(payload),
+                "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest() if prompt else "",
+                "prompt_prefix": prompt[:160],
+            }
+        )
+        return 0
+
+    if not arm_requested:
         state = load_state(payload)
         if prompt and state is not None and state.get("phase") == "deferred_after_plan":
             if looks_like_plan_implementation_intent(prompt):
@@ -624,6 +812,30 @@ def defer_after_plan(payload: dict[str, Any], state: dict[str, Any]) -> int:
     return 0
 
 
+def transition_goal_completion_to_review(
+    payload: dict[str, Any],
+    objective: str,
+    state: dict[str, Any] | None = None,
+) -> int:
+    goal_state = dict(state or {})
+    goal_state["phase"] = "armed"
+    goal_state["review_count"] = 0
+    goal_state["fix_count"] = 0
+    goal_state["activation_prompt_sha256"] = hashlib.sha256(objective.encode()).hexdigest()
+    goal_state["activation_source"] = "goal_complete"
+    cleanup_plan_handoff(payload, cleanup_origin_state=True)
+    save_state(payload, goal_state)
+    append_history(
+        {
+            "event": "goal_armed_late",
+            "state": state_key(payload),
+            "cwd": cwd_from_payload(payload),
+        }
+    )
+    append_debug({"event": "goal_armed_late", "state": state_key(payload)})
+    return transition_to_review(payload, goal_state, "goal_complete_stop")
+
+
 def handle_review_stop(payload: dict[str, Any], state: dict[str, Any]) -> int:
     text = last_assistant_text(payload)
     result = parse_review_result(text)
@@ -668,6 +880,16 @@ def handle_stop(payload: dict[str, Any]) -> int:
 
     state = load_state(payload)
     if state is None:
+        requested, objective, completed_index = goal_auto_review_request_for_completed_goal(payload)
+        if requested:
+            if transcript_has_auto_review_activity(payload, start_index=completed_index + 1):
+                append_debug({"event": "goal_complete_already_reviewed", "state": state_key(payload)})
+                return 0
+            return transition_goal_completion_to_review(payload, objective)
+        waiting_for_goal, _ = latest_goal_auto_review_request(payload)
+        if waiting_for_goal:
+            append_debug({"event": "goal_auto_review_waiting_for_complete", "state": state_key(payload)})
+            return 0
         handoff = load_plan_handoff(payload)
         if handoff is not None:
             state = adopt_plan_handoff(payload, handoff)
@@ -677,10 +899,33 @@ def handle_stop(payload: dict[str, Any]) -> int:
 
     phase = state.get("phase")
     if phase == "armed":
+        requested, objective, completed_index = goal_auto_review_request_for_completed_goal(payload)
+        if requested:
+            if transcript_has_auto_review_activity(payload, start_index=completed_index + 1):
+                append_debug({"event": "goal_complete_already_reviewed", "state": state_key(payload)})
+                cleanup_state(payload)
+                return 0
+            return transition_goal_completion_to_review(payload, objective, state)
+        waiting_for_goal, _ = latest_goal_auto_review_request(payload)
+        if waiting_for_goal:
+            append_debug({"event": "goal_auto_review_waiting_for_complete", "state": state_key(payload)})
+            return 0
         if is_proposed_plan_output(last_assistant_text(payload)):
             return defer_after_plan(payload, state)
         return transition_to_review(payload, state, "task_stop")
     if phase == "deferred_after_plan":
+        requested, objective, completed_index = goal_auto_review_request_for_completed_goal(payload)
+        if requested:
+            if transcript_has_auto_review_activity(payload, start_index=completed_index + 1):
+                append_debug({"event": "goal_complete_already_reviewed", "state": state_key(payload)})
+                cleanup_state(payload)
+                cleanup_plan_handoff(payload)
+                return 0
+            return transition_goal_completion_to_review(payload, objective, state)
+        waiting_for_goal, _ = latest_goal_auto_review_request(payload)
+        if waiting_for_goal:
+            append_debug({"event": "goal_auto_review_waiting_for_complete", "state": state_key(payload)})
+            return 0
         return transition_to_review(payload, state, "plan_implementation_stop")
     if phase == "reviewing":
         return handle_review_stop(payload, state)

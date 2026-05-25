@@ -17,7 +17,12 @@ $auto-review 修复xxx问题
 $auto-review 新增xxx功能
 ```
 
-skill已适配`plan mode`——在plan模式中使用此skill，不会立即触发，而是在实现plan之后才触发。
+skill已适配**`/plan`**和**`/goal`**。
+
+在**plan模式**中使用此skill，不会立即触发，而是在实现plan之后才触发。
+
+在**goal模式**下使用，则会在任务完成（被标记为 `complete`）后触发。
+
 
 ## 前置要求
 
