@@ -16,11 +16,11 @@ $auto-review Fix the xxx issue
 $auto-review Add the xxx feature
 ```
 
-The skill supports **`/plan`**, **`/goal`**.
+The skill supports `/plan`, `/goal`.
 
-When used in **plan mode**, it will not trigger immediately. Instead, it will trigger after the plan is implemented.
+When used in **plan** mode, it will not trigger immediately. Instead, it will trigger after the plan is implemented.
 
-In the **goal mode**, the hook waits until the goal is marked `complete`, then starts the review loop instead of reviewing intermediate goal-continuation turns.
+In the **goal** mode, the hook waits until the goal is marked `complete`, then starts the review loop instead of reviewing intermediate goal-continuation turns.
 
 ## Requirements
 
