@@ -83,6 +83,20 @@ class AutoReviewHookTest(unittest.TestCase):
             },
         }
 
+    def goal_update_event_record(self, objective: str, status: str) -> dict:
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_goal_updated",
+                "threadId": "session-1",
+                "goal": {
+                    "threadId": "session-1",
+                    "objective": objective,
+                    "status": status,
+                },
+            },
+        }
+
     def state_file(self, state_home: Path, session_id: str = "session-1") -> Path:
         return state_home / "state" / f"{session_id}.json"
 
@@ -382,6 +396,45 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertEqual(events[-2]["event"], "goal_armed_late")
             self.assertEqual(events[-1]["event"], "review_prompt")
             self.assertEqual(events[-1]["source"], "goal_complete_stop")
+
+    def test_goal_completion_from_thread_goal_updated_event_emits_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_update_event_record(
+                        "$auto-review 实现这个 0.134.0 goal，完成后自动 review。",
+                        "active",
+                    ),
+                    self.goal_update_event_record(
+                        "$auto-review 实现这个 0.134.0 goal，完成后自动 review。",
+                        "complete",
+                    ),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "目标已完成。"}],
+                        },
+                    },
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            self.assertIn(REVIEW_SENTINEL, block["reason"])
+
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "reviewing")
+            self.assertEqual(state["last_transition"], "goal_complete_stop")
+            self.assertEqual(state["activation_source"], "goal_complete")
 
     def test_goal_completion_without_auto_review_request_does_not_emit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

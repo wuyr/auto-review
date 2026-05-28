@@ -471,24 +471,56 @@ def goal_objectives_from_text(text: str) -> list[str]:
     return objectives
 
 
+def goal_command_objective_from_text(text: str) -> str:
+    match = GOAL_COMMAND_RE.search(text or "")
+    if not match:
+        return ""
+    return text[match.end() :].strip()
+
+
+def parsed_goal_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        goal = payload.get("goal")
+        if isinstance(goal, dict):
+            return goal
+
+        if payload.get("type") == "function_call_output":
+            output = payload.get("output")
+            if isinstance(output, str) and output.strip():
+                try:
+                    value = json.loads(output)
+                except json.JSONDecodeError:
+                    value = None
+                if isinstance(value, dict):
+                    goal = value.get("goal")
+                    if isinstance(goal, dict):
+                        return goal
+
+    goal = record.get("goal")
+    if isinstance(goal, dict):
+        return goal
+    return None
+
+
+def goal_objectives_from_record(record: dict[str, Any]) -> list[str]:
+    objectives = goal_objectives_from_text(text_from_record(record))
+    goal = parsed_goal_from_record(record)
+    if isinstance(goal, dict):
+        objective = str(goal.get("objective") or "").strip()
+        if objective:
+            objectives.append(objective)
+
+    command_objective = goal_command_objective_from_text(text_from_record(record))
+    if command_objective:
+        objectives.append(command_objective)
+    return objectives
+
+
 def goal_completion_index(records: list[dict[str, Any]]) -> int:
     completed_index = -1
     for index, record in enumerate(records):
-        record_payload = record.get("payload")
-        if not isinstance(record_payload, dict):
-            continue
-        if record_payload.get("type") != "function_call_output":
-            continue
-        output = record_payload.get("output")
-        if not isinstance(output, str) or not output.strip():
-            continue
-        try:
-            value = json.loads(output)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(value, dict):
-            continue
-        goal = value.get("goal")
+        goal = parsed_goal_from_record(record)
         if isinstance(goal, dict) and goal.get("status") == "complete":
             completed_index = index
     return completed_index
@@ -505,7 +537,7 @@ def goal_auto_review_request_for_completed_goal(payload: dict[str, Any]) -> tupl
             return False, "", completed_index
 
     for record in reversed(records[: completed_index + 1]):
-        objectives = goal_objectives_from_text(text_from_record(record))
+        objectives = goal_objectives_from_record(record)
         if not objectives:
             continue
         objective = objectives[-1]
@@ -520,7 +552,7 @@ def goal_auto_review_request_for_completed_goal(payload: dict[str, Any]) -> tupl
 def latest_goal_auto_review_request(payload: dict[str, Any]) -> tuple[bool, str]:
     records = transcript_records(payload)
     for record in reversed(records):
-        objectives = goal_objectives_from_text(text_from_record(record))
+        objectives = goal_objectives_from_record(record)
         if not objectives:
             continue
         objective = objectives[-1]
