@@ -279,6 +279,45 @@ def should_arm(prompt: str) -> bool:
     return bool(re.search(r"\$auto-review(?:\s|$|[^A-Za-z0-9_:-])", prompt, re.IGNORECASE))
 
 
+def looks_like_inline_review_intent(prompt: str) -> bool:
+    text = re.sub(
+        r"\$auto-review(?=\s|$|[^A-Za-z0-9_:-])",
+        " ",
+        prompt or "",
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    if not normalized:
+        return False
+
+    english_patterns = (
+        r"\breview\b",
+        r"\bcode\s+review\b",
+        r"\bcheck\b",
+        r"\binspect\b",
+        r"\baudit\b",
+        r"\bmissing\b",
+        r"\blogic\s+error",
+        r"\bregression\b",
+    )
+    if any(re.search(pattern, normalized) for pattern in english_patterns):
+        return True
+
+    chinese_phrases = (
+        "review",
+        "检查",
+        "复查",
+        "审查",
+        "遗漏",
+        "逻辑错误",
+        "回归",
+        "测试缺口",
+        "坑",
+        "闭环",
+    )
+    return any(phrase in text for phrase in chinese_phrases)
+
+
 def has_auto_review_sentinel(prompt: str) -> bool:
     return REVIEW_SENTINEL in prompt or FIX_SENTINEL in prompt
 
@@ -335,6 +374,12 @@ def assistant_text_from_record(record: dict[str, Any]) -> str:
 
     payload = record.get("payload")
     if isinstance(payload, dict):
+        payload_type = payload.get("type")
+        if payload_type == "agent_message":
+            return text_from_value(payload.get("message"))
+        if payload_type == "task_complete":
+            return text_from_value(payload.get("last_agent_message"))
+
         payload_message = payload.get("message")
         if isinstance(payload_message, dict) and payload_message.get("role") == "assistant":
             return text_from_value(payload_message.get("content"))
@@ -551,7 +596,14 @@ def goal_auto_review_request_for_completed_goal(payload: dict[str, Any]) -> tupl
 
 def latest_goal_auto_review_request(payload: dict[str, Any]) -> tuple[bool, str]:
     records = transcript_records(payload)
-    for record in reversed(records):
+    start_index = 0
+    completed_index = goal_completion_index(records)
+    if completed_index >= 0:
+        for index, record in enumerate(records[completed_index + 1 :], start=completed_index + 1):
+            if is_user_supplied_record(record):
+                start_index = index + 1
+
+    for record in reversed(records[start_index:]):
         objectives = goal_objectives_from_record(record)
         if not objectives:
             continue
@@ -798,6 +850,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
         "review_count": 0,
         "fix_count": 0,
         "activation_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "activation_allows_inline_review_result": looks_like_inline_review_intent(prompt),
     }
     save_state(payload, state)
     append_history({"event": "armed", "state": state_key(payload), "cwd": cwd_from_payload(payload)})
@@ -868,6 +921,38 @@ def transition_goal_completion_to_review(
     return transition_to_review(payload, goal_state, "goal_complete_stop")
 
 
+def handle_parsed_review_result(
+    payload: dict[str, Any],
+    state: dict[str, Any],
+    issues_found: bool,
+    issues: list[dict[str, Any]],
+    source: str,
+) -> int:
+    if not issues_found:
+        append_history({"event": "review_clean", "state": state_key(payload), "source": source})
+        cleanup_state(payload)
+        cleanup_plan_handoff(payload)
+        return 0
+
+    fix_count = int(state.get("fix_count") or 0) + 1
+    state["phase"] = "fixing"
+    state["fix_count"] = fix_count
+    state["last_issues"] = issues
+    state["last_transition"] = source
+    save_state(payload, state)
+    append_history(
+        {
+            "event": "fix_prompt",
+            "state": state_key(payload),
+            "fix_count": fix_count,
+            "issue_count": len(issues),
+            "source": source,
+        }
+    )
+    emit_block(fix_prompt(issues, fix_count))
+    return 0
+
+
 def handle_review_stop(payload: dict[str, Any], state: dict[str, Any]) -> int:
     text = last_assistant_text(payload)
     result = parse_review_result(text)
@@ -882,27 +967,33 @@ def handle_review_stop(payload: dict[str, Any], state: dict[str, Any]) -> int:
         return 0
 
     issues_found, issues = result
-    if not issues_found:
-        append_history({"event": "review_clean", "state": state_key(payload)})
-        cleanup_state(payload)
-        cleanup_plan_handoff(payload)
-        return 0
+    return handle_parsed_review_result(payload, state, issues_found, issues, "review_stop")
 
-    fix_count = int(state.get("fix_count") or 0) + 1
-    state["phase"] = "fixing"
-    state["fix_count"] = fix_count
-    state["last_issues"] = issues
-    save_state(payload, state)
+
+def handle_inline_review_result_if_present(
+    payload: dict[str, Any],
+    state: dict[str, Any],
+    source: str,
+) -> int | None:
+    if not state.get("activation_allows_inline_review_result"):
+        return None
+
+    text = last_assistant_text(payload)
+    if "<auto_review_result" not in text:
+        return None
+    result = parse_review_result(text)
+    if result is None:
+        return None
+
+    issues_found, issues = result
     append_history(
         {
-            "event": "fix_prompt",
+            "event": "inline_review_result",
             "state": state_key(payload),
-            "fix_count": fix_count,
-            "issue_count": len(issues),
+            "source": source,
         }
     )
-    emit_block(fix_prompt(issues, fix_count))
-    return 0
+    return handle_parsed_review_result(payload, state, issues_found, issues, source)
 
 
 def handle_stop(payload: dict[str, Any]) -> int:
@@ -938,6 +1029,9 @@ def handle_stop(payload: dict[str, Any]) -> int:
                 cleanup_state(payload)
                 return 0
             return transition_goal_completion_to_review(payload, objective, state)
+        inline_result = handle_inline_review_result_if_present(payload, state, "armed_inline_review")
+        if inline_result is not None:
+            return inline_result
         waiting_for_goal, _ = latest_goal_auto_review_request(payload)
         if waiting_for_goal:
             append_debug({"event": "goal_auto_review_waiting_for_complete", "state": state_key(payload)})
@@ -954,6 +1048,13 @@ def handle_stop(payload: dict[str, Any]) -> int:
                 cleanup_plan_handoff(payload)
                 return 0
             return transition_goal_completion_to_review(payload, objective, state)
+        inline_result = handle_inline_review_result_if_present(
+            payload,
+            state,
+            "deferred_inline_review",
+        )
+        if inline_result is not None:
+            return inline_result
         waiting_for_goal, _ = latest_goal_auto_review_request(payload)
         if waiting_for_goal:
             append_debug({"event": "goal_auto_review_waiting_for_complete", "state": state_key(payload)})
