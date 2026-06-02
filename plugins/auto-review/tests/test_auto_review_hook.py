@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,16 +24,29 @@ PROPOSED_PLAN = "<proposed_plan>\n1. Inspect the code.\n2. Implement the fix.\n<
 
 
 class AutoReviewHookTest(unittest.TestCase):
-    def run_hook(self, payload: dict, state_home: Path) -> subprocess.CompletedProcess[str]:
+    def run_hook(
+        self,
+        payload: dict,
+        state_home: Path | None,
+        extra_env: dict[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        env["AUTO_REVIEW_STATE_HOME"] = str(state_home)
+        if state_home is None:
+            env.pop("AUTO_REVIEW_STATE_HOME", None)
+            env.pop("AUTO_REVIEW_LOOP_STATE_HOME", None)
+        else:
+            env["AUTO_REVIEW_STATE_HOME"] = str(state_home)
+        if extra_env is not None:
+            env.update(extra_env)
         env["PYTHONIOENCODING"] = "utf-8"
         return subprocess.run(
-            ["python3", str(HOOK)],
+            [sys.executable, str(HOOK)],
             input=json.dumps(payload, ensure_ascii=False),
             text=True,
             capture_output=True,
             env=env,
+            cwd=str(cwd) if cwd is not None else None,
             check=False,
         )
 
@@ -115,6 +131,39 @@ class AutoReviewHookTest(unittest.TestCase):
             },
         }
 
+    def plan_item_record(self, text: str = "A completed plan.") -> dict:
+        return {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "Plan",
+                    "id": "plan-item-1",
+                    "text": text,
+                },
+            },
+        }
+
+    def turn_context_record(self, mode: str) -> dict:
+        return {
+            "type": "turn_context",
+            "payload": {
+                "collaboration_mode": {
+                    "mode": mode,
+                },
+            },
+        }
+
+    def developer_message_record(self, text: str) -> dict:
+        return {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        }
+
     def state_file(self, state_home: Path, session_id: str = "session-1") -> Path:
         return state_home / "state" / f"{session_id}.json"
 
@@ -144,6 +193,10 @@ class AutoReviewHookTest(unittest.TestCase):
             for line in history.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+
+    def temp_fallback_state_home(self, cwd: Path) -> Path:
+        digest = hashlib.sha256(str(cwd).encode()).hexdigest()[:16]
+        return Path(tempfile.gettempdir()) / "codex-auto-review" / digest
 
     def test_namespaced_activation_does_not_arm(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -176,6 +229,67 @@ class AutoReviewHookTest(unittest.TestCase):
             state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "reviewing")
             self.assertEqual(state["review_count"], 1)
+
+    def test_state_home_falls_back_to_git_dir_when_codex_home_unusable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            git_dir = workspace / ".git"
+            git_dir.mkdir()
+            fake_home = root / "home-is-file"
+            fake_home.write_text("not a directory", encoding="utf-8")
+
+            payload = {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "session-1",
+                "cwd": str(workspace),
+                "prompt": "$auto-review implement the task",
+            }
+            result = self.run_hook(
+                payload,
+                None,
+                extra_env={"HOME": str(fake_home), "USERPROFILE": str(fake_home)},
+                cwd=workspace,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto_review_armed", result.stdout)
+
+            state_home = git_dir / "auto-review"
+            self.assertTrue(self.state_file(state_home).exists())
+            events = self.history_events(state_home)
+            self.assertEqual(events[-1]["event"], "armed")
+
+    def test_state_home_falls_back_to_portable_temp_dir_without_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            fake_home = root / "home-is-file"
+            fake_home.write_text("not a directory", encoding="utf-8")
+            state_home = self.temp_fallback_state_home(workspace)
+            shutil.rmtree(state_home, ignore_errors=True)
+
+            try:
+                payload = {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "cwd": str(workspace),
+                    "prompt": "$auto-review implement the task",
+                }
+                result = self.run_hook(
+                    payload,
+                    None,
+                    extra_env={"HOME": str(fake_home), "USERPROFILE": str(fake_home)},
+                    cwd=workspace,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("auto_review_armed", result.stdout)
+                self.assertTrue(self.state_file(state_home).exists())
+                events = self.history_events(state_home)
+                self.assertEqual(events[-1]["event"], "armed")
+            finally:
+                shutil.rmtree(state_home, ignore_errors=True)
 
     def test_inline_review_result_in_armed_turn_emits_fix_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -402,6 +516,21 @@ class AutoReviewHookTest(unittest.TestCase):
             payload = self.base_payload("Stop", state_home)
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "deferred_after_plan")
+            self.assertEqual(state["review_count"], 0)
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "实现计划"
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            payload = self.base_payload("Stop", state_home)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
             block = json.loads(result.stdout)
             self.assertEqual(block["decision"], "block")
             self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
@@ -415,6 +544,116 @@ class AutoReviewHookTest(unittest.TestCase):
             events = self.history_events(state_home)
             self.assertEqual(events[-1]["event"], "review_prompt")
             self.assertEqual(events[-1]["source"], "plan_implementation_stop")
+
+    def test_plan_mode_waits_and_plan_item_defers_without_reviewing_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.turn_context_record("plan"),
+                    self.agent_message_record("I am still gathering details for the plan."),
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "armed")
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.turn_context_record("plan"),
+                    self.plan_item_record("# Final implementation plan"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "deferred_after_plan")
+            self.assertEqual(state["review_count"], 0)
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+    def test_deferred_plan_same_session_default_mode_stop_runs_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.transcript(state_home, PROPOSED_PLAN)
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.developer_message_record(
+                        "<collaboration_mode># Collaboration Mode: Default\n\n"
+                        "You are now in Default mode. Any previous instructions for other modes "
+                        "(e.g. Plan mode) are no longer active.\n</collaboration_mode>"
+                    ),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "reviewing")
+            self.assertEqual(state["last_transition"], "plan_implementation_stop")
+
+    def test_plan_mode_wait_then_default_implementation_stop_reviews_late_plan_item(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.turn_context_record("plan"),
+                    self.agent_message_record("The plan is not visible to the hook yet."),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "实现计划"
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.turn_context_record("default"),
+                    self.plan_item_record("# Previously completed plan"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "reviewing")
+            self.assertEqual(state["last_transition"], "plan_implementation_stop")
 
     def test_deferred_plan_cancels_on_unrelated_user_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -544,11 +783,11 @@ class AutoReviewHookTest(unittest.TestCase):
             payload = self.base_payload("Stop", state_home)
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0, result.stderr)
-            block = json.loads(result.stdout)
-            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            self.assertEqual(result.stdout, "")
+            self.assertTrue(self.state_file(state_home, "session-1").exists())
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
             events = self.history_events(state_home)
-            self.assertEqual(events[-1]["event"], "review_prompt")
-            self.assertEqual(events[-1]["source"], "plan_implementation_stop")
+            self.assertEqual(events[-1]["event"], "plan_deferred")
 
     def test_deferred_plan_new_session_stop_can_adopt_handoff_with_implementation_transcript(
         self,

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -29,15 +30,106 @@ GOAL_OBJECTIVE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 STATE_TTL_SECONDS = 12 * 60 * 60
+_CURRENT_PAYLOAD: dict[str, Any] | None = None
+_STATE_BASE_CACHE: dict[str, Path] = {}
 
 
-def state_base() -> Path:
+def portable_home() -> Path | None:
+    try:
+        return Path.home()
+    except RuntimeError:
+        return None
+
+
+def resolved_path(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except (OSError, RuntimeError):
+        try:
+            return path.expanduser().absolute()
+        except RuntimeError:
+            return path.absolute()
+
+
+def git_dir_for_cwd(cwd: str) -> Path | None:
+    current = resolved_path(Path(cwd or os.getcwd()))
+    if current.is_file():
+        current = current.parent
+
+    for directory in (current, *current.parents):
+        dot_git = directory / ".git"
+        if dot_git.is_dir():
+            return dot_git
+        if not dot_git.is_file():
+            continue
+
+        try:
+            raw = dot_git.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        match = re.match(r"gitdir:\s*(.+)", raw, re.IGNORECASE)
+        if not match:
+            continue
+        git_dir = Path(match.group(1).strip())
+        if not git_dir.is_absolute():
+            git_dir = directory / git_dir
+        return resolved_path(git_dir)
+    return None
+
+
+def can_use_state_base(path: Path) -> bool:
+    probe: Path | None = None
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".write-test-{os.getpid()}-{time.time_ns()}"
+        probe.write_text("", encoding="utf-8")
+        return True
+    except (OSError, RuntimeError):
+        return False
+    finally:
+        if probe is not None:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+
+
+def temp_state_base_for_cwd(cwd: str) -> Path:
+    digest = hashlib.sha256(cwd.encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / "codex-auto-review" / digest
+
+
+def state_base(payload: dict[str, Any] | None = None) -> Path:
     override = os.environ.get("AUTO_REVIEW_STATE_HOME") or os.environ.get(
         "AUTO_REVIEW_LOOP_STATE_HOME"
     )
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".codex" / "auto-review"
+
+    effective_payload = payload or _CURRENT_PAYLOAD or {}
+    cwd = cwd_from_payload(effective_payload)
+    cached = _STATE_BASE_CACHE.get(cwd)
+    if cached is not None:
+        return cached
+
+    candidates: list[Path] = []
+    home = portable_home()
+    if home is not None:
+        candidates.append(home / ".codex" / "auto-review")
+
+    git_dir = git_dir_for_cwd(cwd)
+    if git_dir is not None:
+        candidates.append(git_dir / "auto-review")
+
+    candidates.append(temp_state_base_for_cwd(cwd))
+    for candidate in candidates:
+        if can_use_state_base(candidate):
+            _STATE_BASE_CACHE[cwd] = candidate
+            return candidate
+
+    fallback = candidates[-1]
+    _STATE_BASE_CACHE[cwd] = fallback
+    return fallback
 
 
 def now() -> int:
@@ -77,24 +169,24 @@ def cwd_key(payload: dict[str, Any]) -> str:
     return hashlib.sha256(cwd_from_payload(payload).encode()).hexdigest()[:16]
 
 
-def state_path_for_key(key: str) -> Path:
-    return state_base() / "state" / f"{key}.json"
+def state_path_for_key(key: str, payload: dict[str, Any] | None = None) -> Path:
+    return state_base(payload) / "state" / f"{key}.json"
 
 
 def state_path(payload: dict[str, Any]) -> Path:
-    return state_path_for_key(state_key(payload))
+    return state_path_for_key(state_key(payload), payload)
 
 
 def plan_handoff_path(payload: dict[str, Any]) -> Path:
-    return state_base() / "deferred-plan" / f"{cwd_key(payload)}.json"
+    return state_base(payload) / "deferred-plan" / f"{cwd_key(payload)}.json"
 
 
-def history_path() -> Path:
-    return state_base() / "history.jsonl"
+def history_path(payload: dict[str, Any] | None = None) -> Path:
+    return state_base(payload) / "history.jsonl"
 
 
-def debug_path() -> Path:
-    return state_base() / "debug.jsonl"
+def debug_path(payload: dict[str, Any] | None = None) -> Path:
+    return state_base(payload) / "debug.jsonl"
 
 
 def debug_enabled() -> bool:
@@ -229,14 +321,14 @@ def payload_owns_plan_handoff(payload: dict[str, Any], handoff: dict[str, Any] |
 
 
 def cleanup_state(payload: dict[str, Any]) -> None:
-    cleanup_state_key(state_key(payload))
+    cleanup_state_key(state_key(payload), payload)
 
 
-def cleanup_state_key(key: str) -> None:
+def cleanup_state_key(key: str, payload: dict[str, Any] | None = None) -> None:
     if not key:
         return
     try:
-        state_path_for_key(key).unlink()
+        state_path_for_key(key, payload).unlink()
     except FileNotFoundError:
         pass
 
@@ -256,7 +348,7 @@ def cleanup_plan_handoff(payload: dict[str, Any], cleanup_origin_state: bool = F
     except FileNotFoundError:
         pass
     if cleanup_origin_state:
-        cleanup_state_key(origin_state)
+        cleanup_state_key(origin_state, payload)
 
 
 def text_from_value(value: Any) -> str:
@@ -335,6 +427,79 @@ def has_auto_review_sentinel(prompt: str) -> bool:
 
 def is_proposed_plan_output(text: str) -> bool:
     return bool(PROPOSED_PLAN_RE.search(text or ""))
+
+
+def normalized_collaboration_mode(value: Any) -> str:
+    if isinstance(value, dict):
+        mode = normalized_collaboration_mode(value.get("mode"))
+        if mode:
+            return mode
+        return normalized_collaboration_mode(value.get("kind"))
+    text = str(value or "").strip().lower()
+    if text in {"plan", "default"}:
+        return text
+    if "collaboration_mode" in text or "collaboration mode" in text:
+        if (
+            "# collaboration mode: default" in text
+            or "you are now in default mode" in text
+            or text.startswith("default mode")
+        ):
+            return "default"
+        if (
+            "# plan mode" in text
+            or text.startswith("plan mode")
+            or "you are in **plan mode**" in text
+        ):
+            return "plan"
+    return ""
+
+
+def collaboration_mode_from_record(record: dict[str, Any]) -> str:
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        mode = normalized_collaboration_mode(payload.get("collaboration_mode_kind"))
+        if mode:
+            return mode
+        mode = normalized_collaboration_mode(payload.get("collaboration_mode"))
+        if mode:
+            return mode
+
+    text = text_from_record(record)
+    if text and "<collaboration_mode>" in text:
+        return normalized_collaboration_mode(text)
+    return ""
+
+
+def latest_collaboration_mode(payload: dict[str, Any]) -> str:
+    for key in ("collaboration_mode_kind", "collaboration_mode", "mode"):
+        mode = normalized_collaboration_mode(payload.get(key))
+        if mode:
+            return mode
+
+    latest_mode = ""
+    for record in transcript_records(payload):
+        mode = collaboration_mode_from_record(record)
+        if mode:
+            latest_mode = mode
+    return latest_mode
+
+
+def is_plan_item_record(record: dict[str, Any]) -> bool:
+    item = record.get("item")
+    if isinstance(item, dict) and str(item.get("type") or "").lower() == "plan":
+        return True
+
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    item = payload.get("item")
+    return isinstance(item, dict) and str(item.get("type") or "").lower() == "plan"
+
+
+def has_plan_output(payload: dict[str, Any]) -> bool:
+    if is_proposed_plan_output(last_assistant_text(payload)):
+        return True
+    return any(is_plan_item_record(record) for record in transcript_records(payload))
 
 
 def is_goal_workflow_prompt(prompt: str) -> bool:
@@ -501,8 +666,6 @@ def should_adopt_plan_handoff_on_stop(
     payload: dict[str, Any],
     handoff: dict[str, Any],
 ) -> bool:
-    if payload_owns_plan_handoff(payload, handoff):
-        return True
     return stop_payload_has_plan_implementation_intent(payload)
 
 
@@ -743,7 +906,7 @@ def adopt_plan_handoff(payload: dict[str, Any], handoff: dict[str, Any]) -> dict
     save_state(payload, state)
     cleanup_plan_handoff(payload, cleanup_origin_state=True)
     if origin_state and origin_state != state_key(payload):
-        cleanup_state_key(origin_state)
+        cleanup_state_key(origin_state, payload)
     append_history(
         {
             "event": "plan_deferred_adopted",
@@ -813,7 +976,7 @@ def cancel_deferred_plan(
     cleanup_state(payload)
     cleanup_plan_handoff(payload, cleanup_origin_state=True)
     if origin_state:
-        cleanup_state_key(origin_state)
+        cleanup_state_key(origin_state, payload)
 
 
 def handle_user_prompt(payload: dict[str, Any]) -> int:
@@ -858,6 +1021,16 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
                 return 0
 
             cancel_deferred_plan(payload, prompt, state=state)
+            return 0
+
+        if (
+            prompt
+            and state is not None
+            and state.get("phase") == "armed"
+            and state.get("last_transition") == "plan_mode_waiting_for_plan_output"
+            and looks_like_plan_implementation_intent(prompt)
+        ):
+            record_plan_implementation_prompt(payload, state, prompt)
             return 0
 
         if prompt and state is None:
@@ -942,6 +1115,27 @@ def defer_after_plan(payload: dict[str, Any], state: dict[str, Any]) -> int:
     save_plan_handoff(payload, state)
     append_history({"event": "plan_deferred", "state": state_key(payload)})
     append_debug({"event": "plan_deferred", "state": state_key(payload)})
+    return 0
+
+
+def wait_for_plan_output(payload: dict[str, Any], state: dict[str, Any]) -> int:
+    state["last_transition"] = "plan_mode_waiting_for_plan_output"
+    append_debug({"event": "plan_mode_waiting_for_plan_output", "state": state_key(payload)})
+    save_state(payload, state)
+    return 0
+
+
+def plan_implementation_has_started(payload: dict[str, Any], state: dict[str, Any]) -> bool:
+    if state.get("last_transition") == "plan_implementation_prompt":
+        return True
+    if stop_payload_has_plan_implementation_intent(payload):
+        return True
+    return latest_collaboration_mode(payload) == "default"
+
+
+def wait_for_plan_implementation(payload: dict[str, Any], state: dict[str, Any]) -> int:
+    append_debug({"event": "plan_deferred_waiting_for_implementation", "state": state_key(payload)})
+    save_state(payload, state)
     return 0
 
 
@@ -1093,8 +1287,15 @@ def handle_stop(payload: dict[str, Any]) -> int:
         if waiting_for_goal:
             append_debug({"event": "goal_auto_review_waiting_for_complete", "state": state_key(payload)})
             return 0
-        if is_proposed_plan_output(last_assistant_text(payload)):
+        if has_plan_output(payload):
+            if (
+                plan_implementation_has_started(payload, state)
+                and latest_collaboration_mode(payload) != "plan"
+            ):
+                return transition_to_review(payload, state, "plan_implementation_stop")
             return defer_after_plan(payload, state)
+        if latest_collaboration_mode(payload) == "plan":
+            return wait_for_plan_output(payload, state)
         return transition_to_review(payload, state, "task_stop")
     if phase == "deferred_after_plan":
         requested, objective, completed_index = goal_auto_review_request_for_completed_goal(payload)
@@ -1116,6 +1317,8 @@ def handle_stop(payload: dict[str, Any]) -> int:
         if waiting_for_goal:
             append_debug({"event": "goal_auto_review_waiting_for_complete", "state": state_key(payload)})
             return 0
+        if not plan_implementation_has_started(payload, state):
+            return wait_for_plan_implementation(payload, state)
         return transition_to_review(payload, state, "plan_implementation_stop")
     if phase == "reviewing":
         return handle_review_stop(payload, state)
@@ -1128,7 +1331,9 @@ def handle_stop(payload: dict[str, Any]) -> int:
 
 
 def main() -> int:
+    global _CURRENT_PAYLOAD
     payload = read_stdin_json()
+    _CURRENT_PAYLOAD = payload
     event = payload.get("hook_event_name")
     append_debug(
         {
