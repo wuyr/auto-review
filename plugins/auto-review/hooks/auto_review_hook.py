@@ -217,6 +217,17 @@ def save_plan_handoff(payload: dict[str, Any], state: dict[str, Any]) -> None:
     write_json_atomic(plan_handoff_path(payload), handoff)
 
 
+def plan_handoff_origin_state(handoff: dict[str, Any] | None) -> str:
+    if not isinstance(handoff, dict):
+        return ""
+    return str(handoff.get("origin_state_key") or "")
+
+
+def payload_owns_plan_handoff(payload: dict[str, Any], handoff: dict[str, Any] | None) -> bool:
+    origin_state = plan_handoff_origin_state(handoff)
+    return bool(origin_state and origin_state == state_key(payload))
+
+
 def cleanup_state(payload: dict[str, Any]) -> None:
     cleanup_state_key(state_key(payload))
 
@@ -467,6 +478,32 @@ def is_user_supplied_record(record: dict[str, Any]) -> bool:
     if isinstance(payload, dict) and payload.get("type") == "user_message":
         return True
     return record_role(record) == "user"
+
+
+def latest_user_supplied_text(payload: dict[str, Any]) -> str:
+    last_text = ""
+    for record in transcript_records(payload):
+        if is_user_supplied_record(record):
+            text = text_from_record(record)
+            if text:
+                last_text = text
+    return last_text
+
+
+def stop_payload_has_plan_implementation_intent(payload: dict[str, Any]) -> bool:
+    prompt = prompt_from_payload(payload)
+    if looks_like_plan_implementation_intent(prompt):
+        return True
+    return looks_like_plan_implementation_intent(latest_user_supplied_text(payload))
+
+
+def should_adopt_plan_handoff_on_stop(
+    payload: dict[str, Any],
+    handoff: dict[str, Any],
+) -> bool:
+    if payload_owns_plan_handoff(payload, handoff):
+        return True
+    return stop_payload_has_plan_implementation_intent(payload)
 
 
 def last_assistant_text(payload: dict[str, Any]) -> str:
@@ -798,7 +835,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
         handoff = load_plan_handoff(payload)
         if state is not None and state.get("phase") == "deferred_after_plan":
             cancel_deferred_plan(payload, prompt, state=state, handoff=handoff)
-        elif handoff is not None:
+        elif handoff is not None and payload_owns_plan_handoff(payload, handoff):
             cancel_deferred_plan(payload, prompt, handoff=handoff)
         elif state is not None:
             cleanup_state(payload)
@@ -830,7 +867,18 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
                     state = adopt_plan_handoff(payload, handoff)
                     record_plan_implementation_prompt(payload, state, prompt)
                     return 0
-                cancel_deferred_plan(payload, prompt, handoff=handoff)
+                if payload_owns_plan_handoff(payload, handoff):
+                    cancel_deferred_plan(payload, prompt, handoff=handoff)
+                    return 0
+                append_debug(
+                    {
+                        "event": "plan_handoff_foreign_prompt_ignored",
+                        "state": plan_handoff_origin_state(handoff),
+                        "current_state": state_key(payload),
+                        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                        "prompt_prefix": prompt[:160],
+                    }
+                )
                 return 0
 
         append_debug(
@@ -843,7 +891,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
         )
         return 0
     handoff = load_plan_handoff(payload)
-    if handoff is not None:
+    if handoff is not None and payload_owns_plan_handoff(payload, handoff):
         cancel_deferred_plan(payload, prompt, handoff=handoff)
     state = {
         "phase": "armed",
@@ -1015,6 +1063,15 @@ def handle_stop(payload: dict[str, Any]) -> int:
             return 0
         handoff = load_plan_handoff(payload)
         if handoff is not None:
+            if not should_adopt_plan_handoff_on_stop(payload, handoff):
+                append_debug(
+                    {
+                        "event": "plan_handoff_foreign_stop_ignored",
+                        "state": plan_handoff_origin_state(handoff),
+                        "current_state": state_key(payload),
+                    }
+                )
+                return 0
             state = adopt_plan_handoff(payload, handoff)
             return transition_to_review(payload, state, "plan_implementation_stop")
         append_debug({"event": "stop_without_state", "state": state_key(payload)})

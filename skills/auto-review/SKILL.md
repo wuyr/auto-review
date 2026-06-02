@@ -24,7 +24,7 @@ For `/plan` first workflows, keep the same single entrypoint in the initial plan
 $auto-review 为这个需求制定计划：...
 ```
 
-When `/plan` returns a final response containing `<proposed_plan>`, the hook defers review instead of reviewing the plan itself. After the user clicks “实现计划”, clicks “清除当前上下文然后实现计划”, or otherwise asks to implement the plan, the hook runs auto-review when that implementation phase stops. If clearing context creates a new session, the hook can continue the deferred plan through a cwd-scoped handoff. If the user submits an unrelated ordinary prompt while review is deferred after a plan, the hook cancels the deferred state.
+When `/plan` returns a final response containing `<proposed_plan>`, the hook defers review instead of reviewing the plan itself. After the user clicks “实现计划”, clicks “清除当前上下文然后实现计划”, or otherwise asks to implement the plan, the hook runs auto-review when that implementation phase stops. If clearing context creates a new session, the hook can continue the deferred plan through a cwd-scoped handoff. If the original plan session receives an unrelated ordinary prompt while review is deferred after a plan, the hook cancels that deferred state; unrelated prompts in other sessions for the same cwd do not cancel it.
 
 For `/goal` workflows, include `$auto-review` in the goal objective:
 

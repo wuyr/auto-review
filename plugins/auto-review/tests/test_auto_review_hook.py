@@ -513,7 +513,7 @@ class AutoReviewHookTest(unittest.TestCase):
             ])
             self.assertEqual(events[-1]["source"], "plan_implementation_stop")
 
-    def test_deferred_plan_new_session_unrelated_prompt_cancels_handoff(self) -> None:
+    def test_deferred_plan_new_session_unrelated_prompt_does_not_cancel_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             state_home = Path(temp)
             self.arm_session(state_home)
@@ -529,19 +529,30 @@ class AutoReviewHookTest(unittest.TestCase):
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
-            self.assertFalse(self.state_file(state_home, "session-1").exists())
+            self.assertTrue(self.state_file(state_home, "session-1").exists())
             self.assertFalse(self.state_file(state_home, "session-2").exists())
-            self.assertEqual(self.handoff_files(state_home), [])
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
 
             payload = self.base_payload("Stop", state_home, session_id="session-2")
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
-            events = self.history_events(state_home)
-            self.assertEqual(events[-1]["event"], "plan_deferred_cancelled")
-            self.assertEqual(events[-1]["state"], "session-1")
+            self.assertTrue(self.state_file(state_home, "session-1").exists())
+            self.assertFalse(self.state_file(state_home, "session-2").exists())
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
 
-    def test_deferred_plan_new_session_stop_can_adopt_handoff_without_prompt(self) -> None:
+            payload = self.base_payload("Stop", state_home)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            events = self.history_events(state_home)
+            self.assertEqual(events[-1]["event"], "review_prompt")
+            self.assertEqual(events[-1]["source"], "plan_implementation_stop")
+
+    def test_deferred_plan_new_session_stop_can_adopt_handoff_with_implementation_transcript(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             state_home = Path(temp)
             self.arm_session(state_home)
@@ -552,7 +563,27 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
 
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    {
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "A previous agent produced the plan below. "
+                                        "Implement the plan in a fresh context."
+                                    ),
+                                }
+                            ],
+                        }
+                    }
+                ],
+            )
             payload = self.base_payload("Stop", state_home, session_id="session-2")
+            payload["transcript_path"] = str(transcript)
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0, result.stderr)
             block = json.loads(result.stdout)
