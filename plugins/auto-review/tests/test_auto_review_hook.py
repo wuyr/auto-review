@@ -582,6 +582,81 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertEqual(state["review_count"], 0)
             self.assertEqual(len(self.handoff_files(state_home)), 1)
 
+    def test_plan_mode_refinement_after_deferred_plan_preserves_review_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.turn_context_record("plan"),
+                    self.plan_item_record("# Initial implementation plan"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["collaboration_mode_kind"] = "plan"
+            payload["prompt"] = (
+                "补充：如果设备在冻结时间周期内重启，则开机后10分钟内只需要"
+                "做一次补冻结，当成功重冻结后，主动退出轮询"
+            )
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "deferred_after_plan")
+            self.assertEqual(state["last_transition"], "plan_refinement_prompt")
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.turn_context_record("plan"),
+                    self.plan_item_record("# Revised implementation plan"),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "deferred_after_plan")
+            self.assertEqual(len(self.handoff_files(state_home)), 1)
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["collaboration_mode_kind"] = "default"
+            payload["prompt"] = "Implement the plan."
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.turn_context_record("default"),
+                    self.agent_message_record("Implemented the revised plan."),
+                ],
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+            self.assertIn(REVIEW_SENTINEL, block["reason"])
+
+            events = [event["event"] for event in self.history_events(state_home)]
+            self.assertIn("plan_deferred_refinement", events)
+            self.assertNotIn("plan_deferred_cancelled", events)
+
     def test_deferred_plan_same_session_default_mode_stop_runs_review(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             state_home = Path(temp)

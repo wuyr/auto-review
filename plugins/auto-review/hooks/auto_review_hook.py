@@ -543,6 +543,48 @@ def looks_like_plan_implementation_intent(prompt: str) -> bool:
     return any(phrase in prompt for phrase in chinese_phrases)
 
 
+def looks_like_plan_refinement_intent(prompt: str) -> bool:
+    text = re.sub(r"\s+", " ", prompt or "").strip().lower()
+    if not text:
+        return False
+
+    english_patterns = (
+        r"\badd(?:itional)?\s+(?:requirement|constraint|detail|note)s?\b",
+        r"\bone\s+more\s+(?:requirement|constraint|detail|note)\b",
+        r"\bmore\s+(?:requirement|constraint|detail|note)s?\b",
+        r"\bnew\s+(?:requirement|constraint|detail|note)s?\b",
+        r"\brevise(?:\s+the)?\s+plan\b",
+        r"\bupdate(?:\s+the)?\s+plan\b",
+        r"\bmodify(?:\s+the)?\s+plan\b",
+        r"\bchange(?:\s+the)?\s+plan\b",
+        r"\badjust(?:\s+the)?\s+plan\b",
+        r"\brefine(?:\s+the)?\s+plan\b",
+        r"\bclarif(?:y|ication)\b",
+    )
+    if any(re.search(pattern, text) for pattern in english_patterns):
+        return True
+
+    chinese_phrases = (
+        "补充",
+        "追加",
+        "新增要求",
+        "增加要求",
+        "新要求",
+        "再加一个要求",
+        "再加一条",
+        "另外补充",
+        "还有一个要求",
+        "还有一条",
+        "改一下计划",
+        "修改计划",
+        "调整计划",
+        "更新计划",
+        "完善计划",
+        "细化计划",
+    )
+    return any(phrase in prompt for phrase in chinese_phrases)
+
+
 def assistant_text_from_record(record: dict[str, Any]) -> str:
     message = record.get("message")
     if isinstance(message, dict) and message.get("role") == "assistant":
@@ -948,6 +990,36 @@ def record_plan_implementation_prompt(
     )
 
 
+def preserve_deferred_plan_for_refinement(
+    payload: dict[str, Any],
+    state: dict[str, Any],
+    prompt: str,
+) -> None:
+    state["last_transition"] = "plan_refinement_prompt"
+    save_state(payload, state)
+    save_plan_handoff(payload, state)
+    append_history(
+        {
+            "event": "plan_deferred_refinement",
+            "state": state_key(payload),
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        }
+    )
+    append_debug(
+        {
+            "event": "plan_deferred_refinement",
+            "state": state_key(payload),
+            "prompt_prefix": prompt[:160],
+        }
+    )
+
+
+def should_keep_deferred_plan_for_prompt(payload: dict[str, Any], prompt: str) -> bool:
+    if latest_collaboration_mode(payload) == "plan":
+        return True
+    return looks_like_plan_refinement_intent(prompt)
+
+
 def cancel_deferred_plan(
     payload: dict[str, Any],
     prompt: str,
@@ -1020,6 +1092,10 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
                 record_plan_implementation_prompt(payload, state, prompt)
                 return 0
 
+            if should_keep_deferred_plan_for_prompt(payload, prompt):
+                preserve_deferred_plan_for_refinement(payload, state, prompt)
+                return 0
+
             cancel_deferred_plan(payload, prompt, state=state)
             return 0
 
@@ -1039,6 +1115,17 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
                 if looks_like_plan_implementation_intent(prompt):
                     state = adopt_plan_handoff(payload, handoff)
                     record_plan_implementation_prompt(payload, state, prompt)
+                    return 0
+                if should_keep_deferred_plan_for_prompt(payload, prompt):
+                    append_debug(
+                        {
+                            "event": "plan_handoff_refinement_prompt_ignored",
+                            "state": plan_handoff_origin_state(handoff),
+                            "current_state": state_key(payload),
+                            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                            "prompt_prefix": prompt[:160],
+                        }
+                    )
                     return 0
                 if payload_owns_plan_handoff(payload, handoff):
                     cancel_deferred_plan(payload, prompt, handoff=handoff)
