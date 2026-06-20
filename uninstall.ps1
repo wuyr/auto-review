@@ -7,83 +7,75 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$PluginName = "auto-review"
-$PluginRoot = Join-Path $TargetRoot "plugins"
-$PluginDest = Join-Path $PluginRoot $PluginName
-$MarketplacePath = Join-Path $TargetRoot ".agents/plugins/marketplace.json"
-$CodexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { Join-Path $HOME ".codex" } else { $env:CODEX_HOME }
-$CodexHooksPath = Join-Path $CodexHome "hooks.json"
-$SkillDest = Join-Path (Join-Path $CodexHome "skills") $PluginName
+function Test-Python3Command {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Command,
 
-function Test-AutoReviewHookCommand($Hook) {
-    if ($null -eq $Hook -or $null -eq $Hook.command) {
+        [string[]]$PrefixArgs = @()
+    )
+
+    $Executable = Get-Command $Command -ErrorAction SilentlyContinue
+    if ($null -eq $Executable) {
         return $false
     }
 
-    return "$($Hook.command)".Contains("auto_review_hook.py")
+    try {
+        & $Command @PrefixArgs -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" *> $null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
 }
 
-function Remove-AutoReviewHookEntries($Entries) {
-    $Filtered = @()
-    foreach ($Entry in @($Entries)) {
-        if ($null -eq $Entry -or $null -eq $Entry.hooks) {
-            $Filtered += $Entry
-            continue
-        }
-
-        $OriginalHooks = @($Entry.hooks)
-        $KeptHooks = @()
-        foreach ($Hook in $OriginalHooks) {
-            if (-not (Test-AutoReviewHookCommand $Hook)) {
-                $KeptHooks += $Hook
+function Get-Python3Command {
+    if (-not [string]::IsNullOrWhiteSpace($env:PYTHON)) {
+        if (Test-Python3Command -Command $env:PYTHON) {
+            return @{
+                Command = $env:PYTHON
+                Args = @()
             }
         }
 
-        if ($KeptHooks.Count -eq $OriginalHooks.Count) {
-            $Filtered += $Entry
-        } elseif ($KeptHooks.Count -gt 0) {
-            $Entry.hooks = $KeptHooks
-            $Filtered += $Entry
+        throw "PYTHON is set to '$env:PYTHON', but it is not an executable Python 3.10+ command."
+    }
+
+    $Candidates = @(
+        @{ Command = "python3"; Args = @() },
+        @{ Command = "python"; Args = @() },
+        @{ Command = "py"; Args = @("-3") }
+    )
+
+    foreach ($Candidate in $Candidates) {
+        if (Test-Python3Command -Command $Candidate.Command -PrefixArgs $Candidate.Args) {
+            return $Candidate
         }
     }
-    return $Filtered
+
+    throw "Python 3.10 or newer is required. Install Python 3.10+ and ensure 'python3', 'python', or 'py -3' works."
 }
 
-if (Test-Path $MarketplacePath) {
-    $Raw = Get-Content -LiteralPath $MarketplacePath -Raw
-    if (-not [string]::IsNullOrWhiteSpace($Raw)) {
-        $Payload = $Raw | ConvertFrom-Json
-        if ($null -ne $Payload.plugins) {
-            $Payload.plugins = @($Payload.plugins | Where-Object {
-                $_.name -ne $PluginName
-            })
-            $Payload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $MarketplacePath -Encoding UTF8
-        }
-    }
+$CodexHome = if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) { Join-Path $HOME ".codex" } else { $env:CODEX_HOME }
+$Python = Get-Python3Command
+$Helper = Join-Path $PSScriptRoot "scripts/auto_review_installer.py"
+$Arguments = @()
+$Arguments += $Python.Args
+$Arguments += @(
+    $Helper,
+    "uninstall",
+    "--project-root",
+    $PSScriptRoot,
+    "--target-root",
+    $TargetRoot,
+    "--codex-home",
+    $CodexHome
+)
+
+if ($KeepFiles) {
+    $Arguments += "--keep-files"
 }
 
-if (Test-Path $CodexHooksPath) {
-    $Raw = Get-Content -LiteralPath $CodexHooksPath -Raw
-    if (-not [string]::IsNullOrWhiteSpace($Raw)) {
-        $Payload = $Raw | ConvertFrom-Json
-        if ($null -ne $Payload.hooks) {
-            foreach ($EventName in @("UserPromptSubmit", "Stop")) {
-                if ($null -ne $Payload.hooks.$EventName) {
-                    $Payload.hooks.$EventName = @(Remove-AutoReviewHookEntries $Payload.hooks.$EventName)
-                }
-            }
-            $Payload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $CodexHooksPath -Encoding UTF8
-        }
-    }
+& $Python.Command @Arguments
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
 }
-
-if (-not $KeepFiles) {
-    foreach ($ExistingPath in @($PluginDest, $SkillDest)) {
-        if (Test-Path $ExistingPath) {
-            Remove-Item -LiteralPath $ExistingPath -Recurse -Force
-        }
-    }
-}
-
-Write-Host "Uninstalled $PluginName from $TargetRoot."
-Write-Host "Restart Codex to unload hooks."

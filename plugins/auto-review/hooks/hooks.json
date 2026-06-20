@@ -1,5 +1,4 @@
 {
-  "description": "Auto Review hooks: opt-in UserPromptSubmit arming and Stop-driven review/fix loop",
   "hooks": {
     "UserPromptSubmit": [
       {
