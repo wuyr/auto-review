@@ -61,6 +61,15 @@ def command_env(codex_home: Path) -> dict[str, str]:
     return env
 
 
+def find_codex_command() -> str | None:
+    candidates = ["codex.cmd", "codex.exe", "codex"] if os.name == "nt" else ["codex"]
+    for candidate in candidates:
+        path = shutil.which(candidate)
+        if path is not None:
+            return path
+    return None
+
+
 def run_command(
     args: list[str],
     codex_home: Path,
@@ -89,10 +98,12 @@ def run_command(
     return result
 
 
-def require_codex(codex_home: Path) -> None:
-    if shutil.which("codex") is None:
+def require_codex(codex_home: Path) -> str:
+    codex = find_codex_command()
+    if codex is None:
         fail("Codex CLI is required, but 'codex' was not found in PATH.")
-    run_command(["codex", "--version"], codex_home)
+    run_command([codex, "--version"], codex_home)
+    return codex
 
 
 def source_paths(project_root: Path) -> dict[str, Path]:
@@ -349,11 +360,12 @@ def app_server_request(
     fail(f"Timed out waiting for Codex app-server response {request_id}.")
 
 
-def trust_plugin_hooks(codex_home: Path, project_root: Path, selector_name: str) -> None:
-    codex = shutil.which("codex")
-    if codex is None:
-        fail("Cannot trust hooks: codex was not found in PATH.")
-
+def trust_plugin_hooks(
+    codex_home: Path,
+    project_root: Path,
+    selector_name: str,
+    codex: str,
+) -> None:
     process = subprocess.Popen(
         [codex, "app-server", "--listen", "stdio://"],
         stdin=subprocess.PIPE,
@@ -478,7 +490,7 @@ def install(args: argparse.Namespace) -> None:
     codex_home = Path(args.codex_home).expanduser()
     paths = source_paths(project_root)
     check_source_layout(paths)
-    require_codex(codex_home)
+    codex = require_codex(codex_home)
     target_root.mkdir(parents=True, exist_ok=True)
     codex_home.mkdir(parents=True, exist_ok=True)
 
@@ -488,14 +500,14 @@ def install(args: argparse.Namespace) -> None:
     write_or_link_marketplace(paths, target_root, args.mode)
     cleanup_legacy_global_hooks(codex_home)
 
-    run_command(["codex", "plugin", "marketplace", "add", str(target_root)], codex_home)
-    run_command(["codex", "plugin", "add", selector_name], codex_home)
+    run_command([codex, "plugin", "marketplace", "add", str(target_root)], codex_home)
+    run_command([codex, "plugin", "add", selector_name], codex_home)
 
     version = plugin_version(paths["plugin"])
     if args.mode == "symlink":
         link_cache_contents(paths, cache_root(codex_home, market_name, version))
 
-    trust_plugin_hooks(codex_home, project_root, selector_name)
+    trust_plugin_hooks(codex_home, project_root, selector_name, codex)
 
     print(f"Installed {PLUGIN_NAME} using {args.mode} mode.")
     print(f"Plugin: {target_root / 'plugins' / PLUGIN_NAME}")
@@ -568,14 +580,15 @@ def uninstall(args: argparse.Namespace) -> None:
     )
     selector_name = f"{PLUGIN_NAME}@{market_name}"
 
-    if shutil.which("codex") is not None:
+    codex = find_codex_command()
+    if codex is not None:
         run_command(
-            ["codex", "plugin", "remove", selector_name],
+            [codex, "plugin", "remove", selector_name],
             codex_home,
             allow_failure=True,
         )
         run_command(
-            ["codex", "plugin", "marketplace", "remove", market_name],
+            [codex, "plugin", "marketplace", "remove", market_name],
             codex_home,
             allow_failure=True,
         )
