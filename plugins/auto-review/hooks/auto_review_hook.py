@@ -906,15 +906,32 @@ def parse_review_result(text: str) -> tuple[bool, list[dict[str, Any]]] | None:
 def review_prompt(review_count: int) -> str:
     issue_result = (
         '<auto_review_result>{"issues_found":true,"issues":[{"summary":"问题摘要",'
-        '"evidence":"文件/行为证据","fix_hint":"修复建议"}]}</auto_review_result>'
+        '"evidence":"位置、可达触发、错误行为与实际影响","fix_hint":"修复建议"}]}</auto_review_result>'
     )
     clean_result = '<auto_review_result>{"issues_found":false,"issues":[]}</auto_review_result>'
+    revisit_note = (
+        "这是修复后的复审：先验证上一轮问题是否按根因完整关闭，再检查全部累计修改；"
+        "只报告仍然存在或由修复引入的真实缺陷，不要靠收紧未声明契约制造新问题；"
+        if review_count > 1
+        else ""
+    )
     return (
         f"{REVIEW_PROMPT} {REVIEW_SENTINEL} "
-        f"第 {review_count} 次 auto-review：只审本次任务修改，重点查遗漏、逻辑错误、回归风险、测试缺口；"
-        "发现真实问题时先简洁列出问题和证据，无问题则说明未发现阻塞问题；"
+        f"第 {review_count} 次 auto-review：审查本次任务的全部累计修改，不只看最近一处补丁；"
+        "输出前先从用户需求、diff、相关调用点和测试提炼关键不变量，并完成三遍扫描："
+        "①需求遗漏、逻辑和数据流；②同根因、对称分支、状态组合、边界和错误路径；③回归与测试缺口；"
+        "不要在发现第一个问题后停止，继续搜索所有可证实的同类问题，把本轮能发现的问题一次列全，"
+        "同根因合并并列出受影响位置；"
+        "findings 数量没有最低要求，完整性以扫描覆盖面为准、不以问题数量为准；"
+        "若最终只有 0、1 或 2 个真实问题就如实输出，禁止为了显得全面而凑数；"
+        f"{revisit_note}"
+        "问题准入：触发必须位于受支持用法或明确威胁模型内，影响必须实质，且有代码、复现或测试证据；"
+        "低频但现实且高影响的问题仍应报告；除非需求或仓库契约明确要求，不要把不受支持输入、"
+        "需要攻击者任意同步篡改多份可信数据、纯理论竞态、风格/重构偏好或额外加固当成问题；"
+        "每条 evidence 必须同时说明位置、可达触发、错误行为和实际影响；"
+        "有真实问题时列出全部问题和证据，无问题则说明未发现阻塞问题；"
         f"最后必须输出机器可解析结果块：有问题用 {issue_result}，无问题用 {clean_result}；"
-        "不要把格式问题、风格偏好或未证实猜测标记为 issues_found=true。"
+        "不要把未证实猜测标记为 issues_found=true。"
     )
 
 
@@ -923,7 +940,11 @@ def fix_prompt(issues: list[dict[str, Any]], fix_count: int) -> str:
     return (
         f"{FIX_PROMPT} {FIX_SENTINEL} "
         f"第 {fix_count} 次自动修复。上一轮 review 发现的真实问题 JSON：{issues_json}。"
-        "请修复这些问题，完成后正常结束本轮；auto-review 会自动提交下一轮 review prompt。"
+        "请修复全部问题：先把每个 finding 转成被破坏的不变量并定位共同根因；修复根因后，"
+        "搜索并处理所有同类调用点、对称分支、等价状态和边界，补充覆盖这些等价类的回归测试，"
+        "不要只修给出的复现。结束前在本轮内自查全部累计修复和测试结果，并修掉由本轮修复引入的具体回归；"
+        "仍以原需求、受支持用法和明确威胁模型为边界，不扩展成未要求的理论加固。"
+        "完成后正常结束本轮；auto-review 会自动提交下一轮 review prompt。"
         "不要手动提交 review prompt，也不要输出 <auto_review_result>，除非你正在执行 review 阶段。"
     )
 
