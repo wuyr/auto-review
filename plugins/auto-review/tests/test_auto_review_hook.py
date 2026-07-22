@@ -16,6 +16,7 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 HOOK = PLUGIN_ROOT / "hooks" / "auto_review_hook.py"
+HOOKS_CONFIG = PLUGIN_ROOT / "hooks" / "hooks.json"
 REVIEW_PROMPT = "review本次修改，检查是否存在遗漏，逻辑错误等问题"
 FIX_PROMPT = "修复这些问题然后重新做一次review"
 REVIEW_SENTINEL = "<!-- auto-review:review -->"
@@ -24,6 +25,66 @@ PROPOSED_PLAN = "<proposed_plan>\n1. Inspect the code.\n2. Implement the fix.\n<
 
 
 class AutoReviewHookTest(unittest.TestCase):
+    def test_bootstrap_falls_back_when_loaded_cache_root_was_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_home = root / "state-home"
+            workspace = root / "workspace"
+            stable_hooks = root / "codex-home" / "plugins" / "auto-review" / "hooks"
+            workspace.mkdir()
+            stable_hooks.mkdir(parents=True)
+            shutil.copy2(HOOK, stable_hooks / HOOK.name)
+
+            config = json.loads(HOOKS_CONFIG.read_text(encoding="utf-8"))
+            command = config["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            payload = {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "stale-cache-session",
+                "cwd": str(workspace),
+                "prompt": "$auto-review check current changes",
+            }
+            env = os.environ.copy()
+            env["CODEX_HOME"] = str(root / "codex-home")
+            env["CODEX_PLUGIN_ROOT"] = str(root / "removed-cache-version")
+            env["CLAUDE_PLUGIN_ROOT"] = str(root / "also-missing")
+            env["AUTO_REVIEW_STATE_HOME"] = str(state_home)
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            result = subprocess.run(
+                command,
+                input=json.dumps(payload, ensure_ascii=False),
+                text=True,
+                capture_output=True,
+                env=env,
+                cwd=workspace,
+                shell=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto_review_armed", result.stdout)
+            self.assertTrue((state_home / "state" / "stale-cache-session.json").exists())
+
+            stop_command = config["hooks"]["Stop"][0]["hooks"][0]["command"]
+            stop_payload = {
+                "hook_event_name": "Stop",
+                "session_id": "stale-cache-session",
+                "cwd": str(workspace),
+            }
+            stop_result = subprocess.run(
+                stop_command,
+                input=json.dumps(stop_payload, ensure_ascii=False),
+                text=True,
+                capture_output=True,
+                env=env,
+                cwd=workspace,
+                shell=True,
+                check=False,
+            )
+
+            self.assertEqual(stop_result.returncode, 0, stop_result.stderr)
+            self.assertEqual(json.loads(stop_result.stdout)["decision"], "block")
+
     def run_hook(
         self,
         payload: dict,
@@ -117,6 +178,35 @@ class AutoReviewHookTest(unittest.TestCase):
             },
         }
 
+    def goal_custom_tool_output_record(self, objective: str, status: str) -> dict:
+        return {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "Script completed\nWall time 0.0 seconds\nOutput:\n",
+                    },
+                    {"type": "input_text", "text": "{}"},
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "goal": {
+                                    "threadId": "session-1",
+                                    "objective": objective,
+                                    "status": status,
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+            },
+        }
+
     def goal_update_event_record(self, objective: str, status: str) -> dict:
         return {
             "type": "event_msg",
@@ -198,6 +288,28 @@ class AutoReviewHookTest(unittest.TestCase):
         digest = hashlib.sha256(str(cwd).encode()).hexdigest()[:16]
         return Path(tempfile.gettempdir()) / "codex-auto-review" / digest
 
+    def action_result(self, action: str, summary: str = "遗漏空状态") -> str:
+        if action == "clean":
+            payload = {"action": "clean", "issues": []}
+        else:
+            payload = {
+                "action": action,
+                "issues": [
+                    {
+                        "summary": summary,
+                        "evidence": "screen.tsx 的空列表路径可达并显示空白页面",
+                        "requirement_basis": "原始任务要求空状态可用",
+                        "minimal_fix": "在现有组件内渲染 empty state",
+                        "why_in_scope": "screen.tsx 由本任务直接修改",
+                    }
+                ],
+            }
+        return (
+            "<auto_review_result>"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "</auto_review_result>"
+        )
+
     def test_namespaced_activation_does_not_arm(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             state_home = Path(temp)
@@ -219,15 +331,14 @@ class AutoReviewHookTest(unittest.TestCase):
         self.assertIn(REVIEW_SENTINEL, block["reason"])
         self.assertNotIn("systemMessage", block)
         self.assertNotIn("\n", block["reason"])
-        self.assertIn("不要在发现第一个问题后停止", block["reason"])
-        self.assertIn("同根因、对称分支", block["reason"])
-        self.assertIn("findings 数量没有最低要求", block["reason"])
-        self.assertIn("完整性以扫描覆盖面为准、不以问题数量为准", block["reason"])
-        self.assertIn("若最终只有 0、1 或 2 个真实问题就如实输出", block["reason"])
-        self.assertIn("禁止为了显得全面而凑数", block["reason"])
-        self.assertIn("受支持用法或明确威胁模型", block["reason"])
-        self.assertIn("需要攻击者任意同步篡改多份可信数据", block["reason"])
-        self.assertLess(len(block["reason"]), 1800)
+        self.assertIn("首次 discovery", block["reason"])
+        self.assertIn("同一根因", block["reason"])
+        self.assertIn("findings 没有最低数量", block["reason"])
+        self.assertIn("不能自行升级为独立需求依据", block["reason"])
+        self.assertIn("action=fix", block["reason"])
+        self.assertIn("action=needs_replan", block["reason"])
+        self.assertIn("删除新机制、回退原行为、局部修复和新增架构", block["reason"])
+        self.assertLess(len(block["reason"]), 2200)
         return block
 
     def test_activation_arms_and_first_stop_emits_review(self) -> None:
@@ -237,6 +348,103 @@ class AutoReviewHookTest(unittest.TestCase):
             state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "reviewing")
             self.assertEqual(state["review_count"], 1)
+
+    def test_activation_classifies_review_only_and_task_prompts(self) -> None:
+        cases = (
+            ("$auto-review", "existing_changes", True),
+            ("$auto-review 检查一下", "existing_changes", True),
+            ("$auto-review review the current diff", "existing_changes", True),
+            ("$auto-review 修复检查按钮", "task_changes", False),
+            ("$auto-review implement the checker", "task_changes", False),
+        )
+        for index, (prompt, target_mode, allows_inline) in enumerate(cases):
+            with self.subTest(prompt=prompt), tempfile.TemporaryDirectory() as temp:
+                state_home = Path(temp)
+                payload = self.base_payload(
+                    "UserPromptSubmit",
+                    state_home,
+                    session_id=f"session-{index}",
+                )
+                payload["prompt"] = prompt
+                result = self.run_hook(payload, state_home)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                state = json.loads(
+                    self.state_file(state_home, f"session-{index}").read_text(encoding="utf-8")
+                )
+                self.assertEqual(state["review_target_mode"], target_mode)
+                self.assertEqual(state["activation_allows_inline_review_result"], allows_inline)
+
+    def test_bare_activation_skips_clean_git_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            workspace = state_home / "workspace"
+            workspace.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "$auto-review"
+            result = self.run_hook(payload, state_home, cwd=workspace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            payload = self.base_payload("Stop", state_home)
+            result = self.run_hook(payload, state_home, cwd=workspace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto_review_skipped", result.stdout)
+            self.assertFalse(self.state_file(state_home).exists())
+
+    def test_bare_activation_reviews_existing_dirty_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            workspace = state_home / "workspace"
+            workspace.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            (workspace / "change.txt").write_text("dirty\n", encoding="utf-8")
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "$auto-review"
+            result = self.run_hook(payload, state_home, cwd=workspace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            payload = self.base_payload("Stop", state_home)
+            result = self.run_hook(payload, state_home, cwd=workspace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertIn("当前未提交修改", block["reason"])
+            self.assertIn("不推测需求遗漏", block["reason"])
+
+    def test_bare_activation_plan_output_defers_before_clean_tree_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            workspace = state_home / "workspace"
+            workspace.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "$auto-review"
+            result = self.run_hook(payload, state_home, cwd=workspace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            transcript = self.transcript(state_home, PROPOSED_PLAN)
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home, cwd=workspace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "deferred_after_plan")
+
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "实现计划"
+            result = self.run_hook(payload, state_home, cwd=workspace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            payload = self.base_payload("Stop", state_home)
+            result = self.run_hook(payload, state_home, cwd=workspace)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertIn("激活 $auto-review 的任务所产生的修改", block["reason"])
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["review_target_mode"], "task_changes")
 
     def test_state_home_falls_back_to_git_dir_when_codex_home_unusable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -403,6 +611,25 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertEqual(events[-2]["event"], "inline_review_result")
             self.assertEqual(events[-1]["event"], "review_clean")
             self.assertEqual(events[-1]["source"], "armed_inline_review")
+
+    def test_bare_activation_consumes_inline_structured_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "$auto-review"
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            transcript = self.transcript(state_home, self.action_result("clean"))
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+            events = self.history_events(state_home)
+            self.assertEqual(events[-2]["event"], "inline_review_result")
+            self.assertEqual(events[-1]["event"], "review_clean")
 
     def test_ordinary_armed_turn_does_not_consume_accidental_review_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1010,6 +1237,108 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertEqual(state["last_transition"], "goal_complete_stop")
             self.assertEqual(state["activation_source"], "goal_complete")
 
+    def test_goal_completion_from_custom_tool_output_emits_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            objective = "$auto-review 按照方案落地修改。"
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_update_event_record(objective, "active"),
+                    self.goal_custom_tool_output_record(objective, "complete"),
+                    self.task_complete_record("目标已完成。"),
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertIn(REVIEW_SENTINEL, block["reason"])
+
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "reviewing")
+            self.assertEqual(state["last_transition"], "goal_complete_stop")
+
+    def test_goal_completion_uses_latest_goal_in_custom_tool_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            objective = "$auto-review 按照方案落地修改。"
+            goal_output = self.goal_custom_tool_output_record(objective, "complete")
+            goal_output["payload"]["output"].insert(
+                -1,
+                {
+                    "type": "input_text",
+                    "text": json.dumps(
+                        {
+                            "goal": {
+                                "threadId": "session-1",
+                                "objective": objective,
+                                "status": "active",
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            )
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_update_event_record(objective, "active"),
+                    goal_output,
+                    self.task_complete_record("目标已完成。"),
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertEqual(block["decision"], "block")
+            self.assertIn(REVIEW_SENTINEL, block["reason"])
+
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "reviewing")
+            self.assertEqual(state["last_transition"], "goal_complete_stop")
+
+    def test_goal_completion_ignores_json_embedded_in_custom_tool_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            objective = "$auto-review 完成这个目标。"
+            completion = json.dumps(
+                {"goal": {"objective": objective, "status": "complete"}},
+                ensure_ascii=False,
+            )
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_update_event_record(objective, "active"),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "call_exec",
+                            "output": [
+                                {
+                                    "type": "input_text",
+                                    "text": f"diagnostic log contained: {completion}",
+                                }
+                            ],
+                        },
+                    },
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+
     def test_goal_completion_without_auto_review_request_does_not_emit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             state_home = Path(temp)
@@ -1382,16 +1711,148 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertTrue(block["reason"].startswith(FIX_PROMPT))
             self.assertIn(FIX_SENTINEL, block["reason"])
             self.assertIn("遗漏空状态", block["reason"])
-            self.assertIn("定位共同根因", block["reason"])
-            self.assertIn("同类调用点、对称分支、等价状态", block["reason"])
-            self.assertIn("本轮内自查全部累计修复", block["reason"])
-            self.assertIn("不扩展成未要求的理论加固", block["reason"])
+            self.assertIn("删除新机制、回退原行为、局部修复、新增架构", block["reason"])
+            self.assertIn("仅处理同一根因", block["reason"])
+            self.assertIn("不存在范围内的最小修复", block["reason"])
+            self.assertIn("下一轮由 model 判定 needs_replan", block["reason"])
             self.assertNotIn("systemMessage", block)
             self.assertNotIn("\n", block["reason"])
             self.assertNotIn("```json", block["reason"])
             state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "fixing")
             self.assertEqual(state["fix_count"], 1)
+
+    def test_model_fix_action_emits_minimal_fix_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.enter_review_phase(state_home)
+            transcript = self.transcript(state_home, self.action_result("fix"))
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertTrue(block["reason"].startswith(FIX_PROMPT))
+            self.assertIn("原始任务要求空状态可用", block["reason"])
+            self.assertIn("在现有组件内渲染 empty state", block["reason"])
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "fixing")
+            self.assertEqual(len(state["seen_issue_fingerprints"]), 1)
+
+    def test_model_needs_replan_stops_without_marking_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.enter_review_phase(state_home)
+            transcript = self.transcript(
+                state_home,
+                self.action_result("needs_replan", summary="需要改变公开状态协议"),
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto_review_needs_replan", result.stdout)
+            self.assertIn("without marking the review clean", result.stdout)
+            self.assertFalse(self.state_file(state_home).exists())
+            self.assertEqual(self.history_events(state_home)[-1]["event"], "review_needs_replan")
+
+    def test_inline_fix_then_clean_closure_stops_without_second_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = "$auto-review"
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            transcript = self.transcript(state_home, self.action_result("fix"))
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(FIX_PROMPT, result.stdout)
+
+            state_path = self.state_file(state_home)
+            payload = self.base_payload("Stop", state_home)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            block = json.loads(result.stdout)
+            self.assertIn("定向 closure", block["reason"])
+            self.assertIn("修复是否破坏原始需求或跨边界合同", block["reason"])
+
+            transcript = self.transcript(state_home, self.action_result("clean"))
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(state_path.exists())
+            events = self.history_events(state_home)
+            self.assertEqual(events[-1]["event"], "review_clean")
+            self.assertEqual(events[-1]["review_stage"], "closure")
+
+    def test_repeated_exact_finding_pauses_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.enter_review_phase(state_home)
+            marker = self.action_result("fix")
+            transcript = self.transcript(state_home, marker)
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(FIX_PROMPT, result.stdout)
+
+            payload = self.base_payload("Stop", state_home)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("定向 closure", json.loads(result.stdout)["reason"])
+
+            transcript = self.transcript(state_home, marker)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto_review_paused", result.stdout)
+            self.assertIn("repeated_exact_finding", result.stdout)
+            self.assertFalse(self.state_file(state_home).exists())
+
+    def test_automatic_fix_budget_pauses_instead_of_classifying(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.enter_review_phase(state_home)
+            state_path = self.state_file(state_home)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["fix_count"] = 2
+            state["seen_issue_fingerprints"] = []
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            transcript = self.transcript(
+                state_home,
+                self.action_result("fix", summary="第二个独立问题"),
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("auto_review_paused", result.stdout)
+            self.assertIn("automatic_fix_budget_exhausted", result.stdout)
+            self.assertNotIn("needs_replan", result.stdout)
+            self.assertFalse(state_path.exists())
+
+    def test_new_action_requires_model_semantic_basis_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.enter_review_phase(state_home)
+            transcript = self.transcript(
+                state_home,
+                '<auto_review_result>{"action":"fix","issues":[{"summary":"问题",'
+                '"evidence":"可达错误","minimal_fix":"局部修复"}]}</auto_review_result>',
+            )
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("review_result_invalid", result.stdout)
+            self.assertFalse(self.state_file(state_home).exists())
 
     def test_review_result_can_be_read_from_last_assistant_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1422,11 +1883,12 @@ class AutoReviewHookTest(unittest.TestCase):
             block = json.loads(result.stdout)
             self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
             self.assertIn(REVIEW_SENTINEL, block["reason"])
-            self.assertIn("这是修复后的复审", block["reason"])
-            self.assertIn("不只看最近一处补丁", block["reason"])
+            self.assertIn("定向 closure", block["reason"])
+            self.assertIn("不要重新开放对全部累计修改的通用 hunting", block["reason"])
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "reviewing")
             self.assertEqual(state["review_count"], 2)
+            self.assertEqual(state["review_stage"], "closure")
 
     def test_subagent_stop_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1451,7 +1913,7 @@ class AutoReviewHookTest(unittest.TestCase):
             state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "armed")
 
-    def test_invalid_review_result_cleans_state_without_guessing(self) -> None:
+    def test_invalid_review_result_pauses_without_guessing(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             state_home = Path(temp)
             self.enter_review_phase(state_home)
@@ -1461,7 +1923,8 @@ class AutoReviewHookTest(unittest.TestCase):
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0)
             self.assertIn("marker missing or invalid", result.stderr)
-            self.assertEqual(result.stdout, "")
+            self.assertIn("auto_review_paused", result.stdout)
+            self.assertIn("review_result_invalid", result.stdout)
             self.assertFalse(self.state_file(state_home).exists())
 
     def test_bad_state_timestamp_fails_open_and_cleans_state(self) -> None:

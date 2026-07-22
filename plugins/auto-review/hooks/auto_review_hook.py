@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,6 +31,14 @@ GOAL_OBJECTIVE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 STATE_TTL_SECONDS = 12 * 60 * 60
+MAX_AUTOMATIC_FIXES = 2
+ACTION_CLEAN = "clean"
+ACTION_FIX = "fix"
+ACTION_NEEDS_REPLAN = "needs_replan"
+REVIEW_STAGE_DISCOVERY = "discovery"
+REVIEW_STAGE_CLOSURE = "closure"
+TARGET_TASK_CHANGES = "task_changes"
+TARGET_EXISTING_CHANGES = "existing_changes"
 _CURRENT_PAYLOAD: dict[str, Any] | None = None
 _STATE_BASE_CACHE: dict[str, Path] = {}
 
@@ -421,6 +430,56 @@ def looks_like_inline_review_intent(prompt: str) -> bool:
     return any(phrase in text for phrase in chinese_phrases)
 
 
+def prompt_without_activation(prompt: str) -> str:
+    text = re.sub(
+        r"\$auto-review(?=\s|$|[^A-Za-z0-9_:-])",
+        " ",
+        prompt or "",
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def looks_like_review_only_prompt(prompt: str) -> bool:
+    body = prompt_without_activation(prompt)
+    if not body:
+        return True
+    normalized = body.lower()
+    if re.search(r"^(?:please\s+)?(?:review|check|inspect|audit)\b", normalized):
+        return True
+    if re.search(r"^(?:请|帮我|麻烦)?(?:检查|复查|审查|review)", body, re.IGNORECASE):
+        return True
+    change_intent = re.search(
+        r"\b(?:implement|fix|add|update|refactor|build)\b|实现|修复|新增|添加|修改|重构|开发",
+        normalized,
+    )
+    return not change_intent and looks_like_inline_review_intent(prompt)
+
+
+def review_target_for_prompt(prompt: str) -> tuple[str, bool]:
+    review_only = looks_like_review_only_prompt(prompt)
+    if review_only:
+        return TARGET_EXISTING_CHANGES, True
+    return TARGET_TASK_CHANGES, False
+
+
+def git_worktree_has_changes(cwd: str) -> bool | None:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
 def has_auto_review_sentinel(prompt: str) -> bool:
     return REVIEW_SENTINEL in prompt or FIX_SENTINEL in prompt
 
@@ -765,6 +824,17 @@ def goal_command_objective_from_text(text: str) -> str:
     return text[match.end() :].strip()
 
 
+def parsed_goal_from_json_text(text: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    goal = value.get("goal")
+    return goal if isinstance(goal, dict) else None
+
+
 def parsed_goal_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
     payload = record.get("payload")
     if isinstance(payload, dict):
@@ -772,17 +842,25 @@ def parsed_goal_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(goal, dict):
             return goal
 
-        if payload.get("type") == "function_call_output":
-            output = payload.get("output")
-            if isinstance(output, str) and output.strip():
-                try:
-                    value = json.loads(output)
-                except json.JSONDecodeError:
-                    value = None
-                if isinstance(value, dict):
-                    goal = value.get("goal")
-                    if isinstance(goal, dict):
-                        return goal
+        payload_type = payload.get("type")
+        output = payload.get("output")
+        if payload_type == "function_call_output" and isinstance(output, str):
+            goal = parsed_goal_from_json_text(output)
+            if goal is not None:
+                return goal
+        if payload_type == "custom_tool_call_output" and isinstance(output, list):
+            last_goal: dict[str, Any] | None = None
+            for block in output:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if not isinstance(text, str):
+                    continue
+                goal = parsed_goal_from_json_text(text)
+                if goal is not None:
+                    last_goal = goal
+            if last_goal is not None:
+                return last_goal
 
     goal = record.get("goal")
     if isinstance(goal, dict):
@@ -864,7 +942,7 @@ def transcript_has_auto_review_activity(payload: dict[str, Any], start_index: in
     return False
 
 
-def parse_review_result(text: str) -> tuple[bool, list[dict[str, Any]]] | None:
+def parse_review_result(text: str) -> tuple[str, list[dict[str, Any]]] | None:
     matches = RESULT_RE.findall(text or "")
     if not matches:
         return None
@@ -875,9 +953,14 @@ def parse_review_result(text: str) -> tuple[bool, list[dict[str, Any]]] | None:
     if not isinstance(payload, dict):
         return None
 
-    issues_found = payload.get("issues_found")
+    action = payload.get("action")
+    legacy_result = action is None and isinstance(payload.get("issues_found"), bool)
+    if legacy_result:
+        action = ACTION_FIX if payload["issues_found"] else ACTION_CLEAN
+    if action not in {ACTION_CLEAN, ACTION_FIX, ACTION_NEEDS_REPLAN}:
+        return None
     issues = payload.get("issues")
-    if not isinstance(issues_found, bool) or not isinstance(issues, list):
+    if not isinstance(issues, list):
         return None
     normalized_issues: list[dict[str, Any]] = []
     for issue in issues:
@@ -885,53 +968,78 @@ def parse_review_result(text: str) -> tuple[bool, list[dict[str, Any]]] | None:
             return None
         summary = str(issue.get("summary") or "").strip()
         evidence = str(issue.get("evidence") or "").strip()
-        fix_hint = str(issue.get("fix_hint") or "").strip()
-        if not summary:
+        requirement_basis = str(issue.get("requirement_basis") or "").strip()
+        minimal_fix = str(issue.get("minimal_fix") or issue.get("fix_hint") or "").strip()
+        why_in_scope = str(issue.get("why_in_scope") or "").strip()
+        if not summary or not evidence or not minimal_fix:
+            return None
+        if not legacy_result and (not requirement_basis or not why_in_scope):
             return None
         normalized_issues.append(
             {
                 "summary": summary,
                 "evidence": evidence,
-                "fix_hint": fix_hint,
+                "requirement_basis": requirement_basis or "legacy_result",
+                "minimal_fix": minimal_fix,
+                "why_in_scope": why_in_scope or evidence,
             }
         )
 
-    if issues_found and not normalized_issues:
+    if action in {ACTION_FIX, ACTION_NEEDS_REPLAN} and not normalized_issues:
         return None
-    if not issues_found and normalized_issues:
+    if action == ACTION_CLEAN and normalized_issues:
         return None
-    return issues_found, normalized_issues
+    return action, normalized_issues
 
 
-def review_prompt(review_count: int) -> str:
-    issue_result = (
-        '<auto_review_result>{"issues_found":true,"issues":[{"summary":"问题摘要",'
-        '"evidence":"位置、可达触发、错误行为与实际影响","fix_hint":"修复建议"}]}</auto_review_result>'
+def review_prompt(
+    review_count: int,
+    stage: str,
+    target_mode: str,
+    previous_issues: list[dict[str, Any]] | None = None,
+) -> str:
+    issue_shape = (
+        '{"summary":"摘要","evidence":"位置、触发、错误行为和影响",'
+        '"requirement_basis":"原始需求或修改前合同",'
+        '"minimal_fix":"最小修复","why_in_scope":"为何属于本任务"}'
     )
-    clean_result = '<auto_review_result>{"issues_found":false,"issues":[]}</auto_review_result>'
-    revisit_note = (
-        "这是修复后的复审：先验证上一轮问题是否按根因完整关闭，再检查全部累计修改；"
-        "只报告仍然存在或由修复引入的真实缺陷，不要靠收紧未声明契约制造新问题；"
-        if review_count > 1
-        else ""
+    clean_result = '<auto_review_result>{"action":"clean","issues":[]}</auto_review_result>'
+    fix_result = (
+        f'<auto_review_result>{{"action":"fix","issues":[{issue_shape}]}}</auto_review_result>'
     )
+    replan_result = (
+        f'<auto_review_result>{{"action":"needs_replan","issues":[{issue_shape}]}}</auto_review_result>'
+    )
+    if target_mode == TARGET_EXISTING_CHANGES:
+        target_note = (
+            "目标是当前未提交修改；优先使用同 session 最近的实质任务作为需求依据。"
+            "若找不到原始需求，只审代码可证实的逻辑、回归、兼容性、安全和测试问题，不推测需求遗漏；"
+        )
+    else:
+        target_note = "目标是激活 $auto-review 的任务所产生的修改，以原始请求和修改前仓库合同为依据；"
+
+    summaries = [str(issue.get("summary") or "") for issue in previous_issues or []]
+    if stage == REVIEW_STAGE_CLOSURE:
+        stage_note = (
+            f"当前是定向 closure：验证上一轮问题 {json.dumps(summaries, ensure_ascii=False)}、"
+            "本次修复 diff、直接调用方，以及修复是否破坏原始需求或跨边界合同；"
+            "不要重新开放对全部累计修改的通用 hunting；"
+        )
+    else:
+        stage_note = (
+            "当前是首次 discovery：对目标做一次完整审查，并把同一根因、可由同一修复关闭的受支持变体合并报告；"
+        )
     return (
         f"{REVIEW_PROMPT} {REVIEW_SENTINEL} "
-        f"第 {review_count} 次 auto-review：审查本次任务的全部累计修改，不只看最近一处补丁；"
-        "输出前先从用户需求、diff、相关调用点和测试提炼关键不变量，并完成三遍扫描："
-        "①需求遗漏、逻辑和数据流；②同根因、对称分支、状态组合、边界和错误路径；③回归与测试缺口；"
-        "不要在发现第一个问题后停止，继续搜索所有可证实的同类问题，把本轮能发现的问题一次列全，"
-        "同根因合并并列出受影响位置；"
-        "findings 数量没有最低要求，完整性以扫描覆盖面为准、不以问题数量为准；"
-        "若最终只有 0、1 或 2 个真实问题就如实输出，禁止为了显得全面而凑数；"
-        f"{revisit_note}"
-        "问题准入：触发必须位于受支持用法或明确威胁模型内，影响必须实质，且有代码、复现或测试证据；"
-        "低频但现实且高影响的问题仍应报告；除非需求或仓库契约明确要求，不要把不受支持输入、"
-        "需要攻击者任意同步篡改多份可信数据、纯理论竞态、风格/重构偏好或额外加固当成问题；"
-        "每条 evidence 必须同时说明位置、可达触发、错误行为和实际影响；"
-        "有真实问题时列出全部问题和证据，无问题则说明未发现阻塞问题；"
-        f"最后必须输出机器可解析结果块：有问题用 {issue_result}，无问题用 {clean_result}；"
-        "不要把未证实猜测标记为 issues_found=true。"
+        f"第 {review_count} 次 auto-review；{target_note}{stage_note}"
+        "本次 diff 新增的文档、schema 和测试属于实现选择，不能自行升级为独立需求依据。"
+        "仅报告受支持路径可达、影响实质、有直接证据且修复与风险成比例的问题；"
+        "风格偏好、理论加固和缺少依据的合同收紧不阻塞。findings 没有最低数量，不要凑数。"
+        "语义分类由你完成：存在范围内最小修复时 action=fix；问题真实但合理解决需要扩大架构、"
+        "改变原需求或无法证明有比例合理的最小修复时 action=needs_replan；没有阻塞问题时 action=clean。"
+        "选择 fix 前依次比较删除新机制、回退原行为、局部修复和新增架构。"
+        f"最后必须输出且仅输出一个机器结果块：clean 用 {clean_result}；fix 用 {fix_result}；"
+        f"需要重新规划用 {replan_result}。"
     )
 
 
@@ -940,10 +1048,11 @@ def fix_prompt(issues: list[dict[str, Any]], fix_count: int) -> str:
     return (
         f"{FIX_PROMPT} {FIX_SENTINEL} "
         f"第 {fix_count} 次自动修复。上一轮 review 发现的真实问题 JSON：{issues_json}。"
-        "请修复全部问题：先把每个 finding 转成被破坏的不变量并定位共同根因；修复根因后，"
-        "搜索并处理所有同类调用点、对称分支、等价状态和边界，补充覆盖这些等价类的回归测试，"
-        "不要只修给出的复现。结束前在本轮内自查全部累计修复和测试结果，并修掉由本轮修复引入的具体回归；"
-        "仍以原需求、受支持用法和明确威胁模型为边界，不扩展成未要求的理论加固。"
+        "只修复这些已确认问题。按删除新机制、回退原行为、局部修复、新增架构的顺序选择最小方案；"
+        "仅处理同一根因且位于原任务范围内的直接等价位置，并补充聚焦的回归测试。"
+        "本轮新增的合同不能成为扩大修复范围的理由；若不存在范围内的最小修复，不要引入新 schema、"
+        "公共状态机或生命周期，说明原因并结束，下一轮由 model 判定 needs_replan。"
+        "结束前自查本轮修复及测试结果，修复由本轮直接引入的具体回归。"
         "完成后正常结束本轮；auto-review 会自动提交下一轮 review prompt。"
         "不要手动提交 review prompt，也不要输出 <auto_review_result>，除非你正在执行 review 阶段。"
     )
@@ -959,6 +1068,74 @@ def emit_block(prompt: str) -> None:
             ensure_ascii=False,
         )
     )
+
+
+def issue_fingerprint(issue: dict[str, Any]) -> str:
+    identity = {
+        "summary": str(issue.get("summary") or "").strip(),
+        "evidence": str(issue.get("evidence") or "").strip(),
+        "requirement_basis": str(issue.get("requirement_basis") or "").strip(),
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def pause_automation(
+    payload: dict[str, Any],
+    reason: str,
+    issues: list[dict[str, Any]],
+    source: str,
+) -> int:
+    summaries = [str(issue.get("summary") or "") for issue in issues]
+    append_history(
+        {
+            "event": "automation_paused",
+            "state": state_key(payload),
+            "reason": reason,
+            "source": source,
+            "issue_count": len(issues),
+        }
+    )
+    cleanup_state(payload)
+    cleanup_plan_handoff(payload)
+    print(
+        "<auto_review_paused>"
+        + json.dumps(
+            {
+                "reason": reason,
+                "issues": summaries,
+                "message": "Automatic repair stopped without marking the review clean.",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "</auto_review_paused>"
+    )
+    return 0
+
+
+def finish_needs_replan(
+    payload: dict[str, Any],
+    issues: list[dict[str, Any]],
+    source: str,
+) -> int:
+    append_history(
+        {
+            "event": "review_needs_replan",
+            "state": state_key(payload),
+            "source": source,
+            "issue_count": len(issues),
+        }
+    )
+    cleanup_state(payload)
+    cleanup_plan_handoff(payload)
+    print(
+        "<auto_review_needs_replan>"
+        "The model found real issues but no proportionate in-scope automatic fix. "
+        "Automatic mutation stopped without marking the review clean."
+        "</auto_review_needs_replan>"
+    )
+    return 0
 
 
 def adopt_plan_handoff(payload: dict[str, Any], handoff: dict[str, Any]) -> dict[str, Any]:
@@ -994,6 +1171,7 @@ def record_plan_implementation_prompt(
     prompt: str,
 ) -> None:
     state["last_transition"] = "plan_implementation_prompt"
+    state["review_target_mode"] = TARGET_TASK_CHANGES
     save_state(payload, state)
     append_history(
         {
@@ -1174,12 +1352,16 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
     handoff = load_plan_handoff(payload)
     if handoff is not None and payload_owns_plan_handoff(payload, handoff):
         cancel_deferred_plan(payload, prompt, handoff=handoff)
+    target_mode, allows_inline = review_target_for_prompt(prompt)
     state = {
         "phase": "armed",
         "review_count": 0,
         "fix_count": 0,
+        "review_stage": REVIEW_STAGE_DISCOVERY,
         "activation_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-        "activation_allows_inline_review_result": looks_like_inline_review_intent(prompt),
+        "activation_allows_inline_review_result": allows_inline,
+        "review_target_mode": target_mode,
+        "seen_issue_fingerprints": [],
     }
     save_state(payload, state)
     append_history({"event": "armed", "state": state_key(payload), "cwd": cwd_from_payload(payload)})
@@ -1196,10 +1378,19 @@ def is_subagent_stop(payload: dict[str, Any]) -> bool:
     return payload.get("hook_event_name") == "SubagentStop" or bool(payload.get("parent_session_id"))
 
 
-def transition_to_review(payload: dict[str, Any], state: dict[str, Any], source: str) -> int:
+def transition_to_review(
+    payload: dict[str, Any],
+    state: dict[str, Any],
+    source: str,
+    stage: str | None = None,
+) -> int:
     review_count = int(state.get("review_count") or 0) + 1
+    review_stage = stage or str(state.get("review_stage") or REVIEW_STAGE_DISCOVERY)
+    if source == "plan_implementation_stop":
+        state["review_target_mode"] = TARGET_TASK_CHANGES
     state["phase"] = "reviewing"
     state["review_count"] = review_count
+    state["review_stage"] = review_stage
     state["last_transition"] = source
     save_state(payload, state)
     if source == "plan_implementation_stop":
@@ -1209,10 +1400,18 @@ def transition_to_review(payload: dict[str, Any], state: dict[str, Any], source:
             "event": "review_prompt",
             "state": state_key(payload),
             "review_count": review_count,
+            "review_stage": review_stage,
             "source": source,
         }
     )
-    emit_block(review_prompt(review_count))
+    emit_block(
+        review_prompt(
+            review_count,
+            review_stage,
+            str(state.get("review_target_mode") or TARGET_TASK_CHANGES),
+            state.get("last_issues") if isinstance(state.get("last_issues"), list) else None,
+        )
+    )
     return 0
 
 
@@ -1256,8 +1455,12 @@ def transition_goal_completion_to_review(
     goal_state["phase"] = "armed"
     goal_state["review_count"] = 0
     goal_state["fix_count"] = 0
+    goal_state["review_stage"] = REVIEW_STAGE_DISCOVERY
+    goal_state["last_issues"] = []
     goal_state["activation_prompt_sha256"] = hashlib.sha256(objective.encode()).hexdigest()
     goal_state["activation_source"] = "goal_complete"
+    goal_state["review_target_mode"] = TARGET_TASK_CHANGES
+    goal_state["seen_issue_fingerprints"] = []
     cleanup_plan_handoff(payload, cleanup_origin_state=True)
     save_state(payload, goal_state)
     append_history(
@@ -1274,20 +1477,45 @@ def transition_goal_completion_to_review(
 def handle_parsed_review_result(
     payload: dict[str, Any],
     state: dict[str, Any],
-    issues_found: bool,
+    action: str,
     issues: list[dict[str, Any]],
     source: str,
 ) -> int:
-    if not issues_found:
-        append_history({"event": "review_clean", "state": state_key(payload), "source": source})
+    review_stage = str(state.get("review_stage") or REVIEW_STAGE_DISCOVERY)
+    if action == ACTION_CLEAN:
+        append_history(
+            {
+                "event": "review_clean",
+                "state": state_key(payload),
+                "source": source,
+                "review_stage": review_stage,
+            }
+        )
         cleanup_state(payload)
         cleanup_plan_handoff(payload)
         return 0
 
-    fix_count = int(state.get("fix_count") or 0) + 1
+    if action == ACTION_NEEDS_REPLAN:
+        return finish_needs_replan(payload, issues, source)
+
+    seen = {
+        str(value)
+        for value in state.get("seen_issue_fingerprints", [])
+        if isinstance(value, str) and value
+    }
+    current = {issue_fingerprint(issue) for issue in issues}
+    if seen.intersection(current):
+        return pause_automation(payload, "repeated_exact_finding", issues, source)
+
+    previous_fix_count = int(state.get("fix_count") or 0)
+    if previous_fix_count >= MAX_AUTOMATIC_FIXES:
+        return pause_automation(payload, "automatic_fix_budget_exhausted", issues, source)
+
+    fix_count = previous_fix_count + 1
     state["phase"] = "fixing"
     state["fix_count"] = fix_count
     state["last_issues"] = issues
+    state["seen_issue_fingerprints"] = sorted(seen.union(current))
     state["last_transition"] = source
     save_state(payload, state)
     append_history(
@@ -1296,6 +1524,7 @@ def handle_parsed_review_result(
             "state": state_key(payload),
             "fix_count": fix_count,
             "issue_count": len(issues),
+            "review_stage": review_stage,
             "source": source,
         }
     )
@@ -1308,16 +1537,14 @@ def handle_review_stop(payload: dict[str, Any], state: dict[str, Any]) -> int:
     result = parse_review_result(text)
     if result is None:
         append_history({"event": "review_result_invalid", "state": state_key(payload)})
-        cleanup_state(payload)
-        cleanup_plan_handoff(payload)
         print(
-            "auto-review: review result marker missing or invalid; loop stopped without guessing.",
+            "auto-review: review result marker missing or invalid; automatic repair paused.",
             file=sys.stderr,
         )
-        return 0
+        return pause_automation(payload, "review_result_invalid", [], "review_stop")
 
-    issues_found, issues = result
-    return handle_parsed_review_result(payload, state, issues_found, issues, "review_stop")
+    action, issues = result
+    return handle_parsed_review_result(payload, state, action, issues, "review_stop")
 
 
 def handle_inline_review_result_if_present(
@@ -1335,7 +1562,7 @@ def handle_inline_review_result_if_present(
     if result is None:
         return None
 
-    issues_found, issues = result
+    action, issues = result
     append_history(
         {
             "event": "inline_review_result",
@@ -1343,7 +1570,7 @@ def handle_inline_review_result_if_present(
             "source": source,
         }
     )
-    return handle_parsed_review_result(payload, state, issues_found, issues, source)
+    return handle_parsed_review_result(payload, state, action, issues, source)
 
 
 def handle_stop(payload: dict[str, Any]) -> int:
@@ -1404,6 +1631,22 @@ def handle_stop(payload: dict[str, Any]) -> int:
             return defer_after_plan(payload, state)
         if latest_collaboration_mode(payload) == "plan":
             return wait_for_plan_output(payload, state)
+        if state.get("review_target_mode") == TARGET_EXISTING_CHANGES:
+            has_changes = git_worktree_has_changes(cwd_from_payload(payload))
+            if has_changes is False:
+                append_history(
+                    {
+                        "event": "review_skipped_no_changes",
+                        "state": state_key(payload),
+                    }
+                )
+                cleanup_state(payload)
+                cleanup_plan_handoff(payload)
+                print(
+                    "<auto_review_skipped>No uncommitted changes were available to review."
+                    "</auto_review_skipped>"
+                )
+                return 0
         return transition_to_review(payload, state, "task_stop")
     if phase == "deferred_after_plan":
         requested, objective, completed_index = goal_auto_review_request_for_completed_goal(payload)
@@ -1431,7 +1674,12 @@ def handle_stop(payload: dict[str, Any]) -> int:
     if phase == "reviewing":
         return handle_review_stop(payload, state)
     if phase == "fixing":
-        return transition_to_review(payload, state, "fix_stop")
+        return transition_to_review(
+            payload,
+            state,
+            "fix_stop",
+            stage=REVIEW_STAGE_CLOSURE,
+        )
 
     append_history({"event": "state_unknown_phase", "state": state_key(payload), "phase": phase})
     cleanup_state(payload)

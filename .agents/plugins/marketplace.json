@@ -1,11 +1,11 @@
 {
-  "name": "auto-review-local",
+  "name": "review-runtime-local",
   "interface": {
-    "displayName": "Auto Review Local"
+    "displayName": "Review Runtime Local"
   },
   "plugins": [
     {
-      "name": "auto-review",
+      "name": "review-runtime",
       "source": {
         "source": "local",
         "path": "./plugins/auto-review"

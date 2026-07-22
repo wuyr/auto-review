@@ -15,8 +15,15 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_NAME = "auto-review"
-DEFAULT_MARKETPLACE_NAME = "auto-review-local"
+PRODUCT_NAME = "auto-review"
+# Keep runtime IDs distinct from the skill name so Codex's shared mention picker has one match.
+PLUGIN_ID = "review-runtime"
+PLUGIN_DIR_NAME = "auto-review"
+SKILL_NAME = "auto-review"
+DEFAULT_MARKETPLACE_NAME = "review-runtime-local"
+LEGACY_PLUGIN_ID = "auto-review"
+LEGACY_MARKETPLACE_NAME = "auto-review-local"
+OWNED_PLUGIN_IDS = frozenset((PLUGIN_ID, LEGACY_PLUGIN_ID))
 HOOK_EVENTS = ("UserPromptSubmit", "Stop")
 
 
@@ -109,8 +116,8 @@ def require_codex(codex_home: Path) -> str:
 def source_paths(project_root: Path) -> dict[str, Path]:
     return {
         "project": project_root,
-        "plugin": project_root / "plugins" / PLUGIN_NAME,
-        "skill": project_root / "skills" / PLUGIN_NAME,
+        "plugin": project_root / "plugins" / PLUGIN_DIR_NAME,
+        "skill": project_root / "skills" / SKILL_NAME,
         "marketplace": project_root / ".agents" / "plugins" / "marketplace.json",
     }
 
@@ -181,12 +188,12 @@ def install_plugin_and_skill(
     mode: str,
     force: bool,
 ) -> None:
-    plugin_dest = target_root / "plugins" / PLUGIN_NAME
-    skill_dest = codex_home / "skills" / PLUGIN_NAME
+    plugin_dest = target_root / "plugins" / PLUGIN_DIR_NAME
+    skill_dest = codex_home / "skills" / SKILL_NAME
 
-    if resolved(paths["plugin"]) == resolved(plugin_dest):
+    if not plugin_dest.is_symlink() and resolved(paths["plugin"]) == resolved(plugin_dest):
         fail(f"Plugin install target resolves to the source directory: {plugin_dest}")
-    if resolved(paths["skill"]) == resolved(skill_dest):
+    if not skill_dest.is_symlink() and resolved(paths["skill"]) == resolved(skill_dest):
         fail(f"Skill install target resolves to the source directory: {skill_dest}")
 
     for dest in (plugin_dest, skill_dest):
@@ -211,15 +218,15 @@ def target_marketplace_has_other_plugins(marketplace_path: Path) -> bool:
     if not isinstance(plugins, list):
         fail(f"existing marketplace.json field 'plugins' must be an array: {marketplace_path}")
     return any(
-        not (isinstance(item, dict) and item.get("name") == PLUGIN_NAME)
+        not (isinstance(item, dict) and item.get("name") in OWNED_PLUGIN_IDS)
         for item in plugins
     )
 
 
 def auto_review_marketplace_entry() -> dict[str, Any]:
     return {
-        "name": PLUGIN_NAME,
-        "source": {"source": "local", "path": f"./plugins/{PLUGIN_NAME}"},
+        "name": PLUGIN_ID,
+        "source": {"source": "local", "path": f"./plugins/{PLUGIN_DIR_NAME}"},
         "policy": {"installation": "INSTALLED_BY_DEFAULT", "authentication": "ON_INSTALL"},
         "category": "Productivity",
     }
@@ -260,7 +267,7 @@ def write_or_link_marketplace(
     payload["plugins"] = [
         item
         for item in plugins
-        if not (isinstance(item, dict) and item.get("name") == PLUGIN_NAME)
+        if not (isinstance(item, dict) and item.get("name") in OWNED_PLUGIN_IDS)
     ]
     payload["plugins"].append(auto_review_marketplace_entry())
     write_json(marketplace_path, payload)
@@ -318,7 +325,7 @@ def cleanup_legacy_global_hooks(codex_home: Path) -> None:
 
 
 def cache_root(codex_home: Path, market_name: str, version: str) -> Path:
-    return codex_home / "plugins" / "cache" / market_name / PLUGIN_NAME / version
+    return codex_home / "plugins" / "cache" / market_name / PLUGIN_ID / version
 
 
 def link_cache_contents(paths: dict[str, Path], cache_dest: Path) -> None:
@@ -495,7 +502,19 @@ def install(args: argparse.Namespace) -> None:
     codex_home.mkdir(parents=True, exist_ok=True)
 
     market_name = marketplace_name(paths["marketplace"])
-    selector_name = f"{PLUGIN_NAME}@{market_name}"
+    selector_name = f"{PLUGIN_ID}@{market_name}"
+    legacy_selector = f"{LEGACY_PLUGIN_ID}@{LEGACY_MARKETPLACE_NAME}"
+    run_command(
+        [codex, "plugin", "remove", legacy_selector],
+        codex_home,
+        allow_failure=True,
+    )
+    run_command(
+        [codex, "plugin", "marketplace", "remove", LEGACY_MARKETPLACE_NAME],
+        codex_home,
+        allow_failure=True,
+    )
+    remove_config_sections(codex_home, LEGACY_PLUGIN_ID, LEGACY_MARKETPLACE_NAME)
     install_plugin_and_skill(paths, target_root, codex_home, args.mode, args.force)
     write_or_link_marketplace(paths, target_root, args.mode)
     cleanup_legacy_global_hooks(codex_home)
@@ -509,12 +528,12 @@ def install(args: argparse.Namespace) -> None:
 
     trust_plugin_hooks(codex_home, project_root, selector_name, codex)
 
-    print(f"Installed {PLUGIN_NAME} using {args.mode} mode.")
-    print(f"Plugin: {target_root / 'plugins' / PLUGIN_NAME}")
+    print(f"Installed {PRODUCT_NAME} using {args.mode} mode.")
+    print(f"Plugin: {target_root / 'plugins' / PLUGIN_DIR_NAME}")
     print(f"Marketplace: {target_root / '.agents' / 'plugins' / 'marketplace.json'}")
     print(f"Plugin selector: {selector_name}")
     print(f"Hook trust: {codex_home / 'config.toml'}")
-    print(f"Skill: {codex_home / 'skills' / PLUGIN_NAME}")
+    print(f"Skill: {codex_home / 'skills' / SKILL_NAME}")
     print("Restart Codex, then use: $auto-review <your task>")
 
 
@@ -532,12 +551,12 @@ def remove_marketplace_entry(target_root: Path, keep_files: bool) -> None:
         payload["plugins"] = [
             item
             for item in plugins
-            if not (isinstance(item, dict) and item.get("name") == PLUGIN_NAME)
+            if not (isinstance(item, dict) and item.get("name") in OWNED_PLUGIN_IDS)
         ]
         write_json(marketplace_path, payload)
 
 
-def remove_config_sections(codex_home: Path, market_name: str) -> None:
+def remove_config_sections(codex_home: Path, plugin_id: str, market_name: str) -> None:
     config_path = codex_home / "config.toml"
     if not config_path.exists():
         return
@@ -548,7 +567,7 @@ def remove_config_sections(codex_home: Path, market_name: str) -> None:
 
     remove_headers = {
         f"[marketplaces.{market_name}]",
-        f'[plugins."{PLUGIN_NAME}@{market_name}"]',
+        f'[plugins."{plugin_id}@{market_name}"]',
     }
     kept: list[str] = []
     skipping = False
@@ -557,7 +576,7 @@ def remove_config_sections(codex_home: Path, market_name: str) -> None:
         if stripped.startswith("[") and stripped.endswith("]"):
             skipping = (
                 stripped in remove_headers
-                or stripped.startswith(f'[hooks.state."{PLUGIN_NAME}@{market_name}:')
+                or stripped.startswith(f'[hooks.state."{plugin_id}@{market_name}:')
                 or stripped.startswith('[hooks.state."')
                 and "auto_review_hook.py" in stripped
             )
@@ -578,20 +597,23 @@ def uninstall(args: argparse.Namespace) -> None:
         if paths["marketplace"].exists()
         else DEFAULT_MARKETPLACE_NAME
     )
-    selector_name = f"{PLUGIN_NAME}@{market_name}"
+    selector_name = f"{PLUGIN_ID}@{market_name}"
+    legacy_selector = f"{LEGACY_PLUGIN_ID}@{LEGACY_MARKETPLACE_NAME}"
 
     codex = find_codex_command()
     if codex is not None:
-        run_command(
-            [codex, "plugin", "remove", selector_name],
-            codex_home,
-            allow_failure=True,
-        )
-        run_command(
-            [codex, "plugin", "marketplace", "remove", market_name],
-            codex_home,
-            allow_failure=True,
-        )
+        for selector in (selector_name, legacy_selector):
+            run_command(
+                [codex, "plugin", "remove", selector],
+                codex_home,
+                allow_failure=True,
+            )
+        for marketplace in dict.fromkeys((market_name, LEGACY_MARKETPLACE_NAME)):
+            run_command(
+                [codex, "plugin", "marketplace", "remove", marketplace],
+                codex_home,
+                allow_failure=True,
+            )
 
     if codex_home.exists():
         cleanup_legacy_global_hooks(codex_home)
@@ -599,15 +621,21 @@ def uninstall(args: argparse.Namespace) -> None:
 
     if not args.keep_files:
         for path in (
-            target_root / "plugins" / PLUGIN_NAME,
-            codex_home / "skills" / PLUGIN_NAME,
-            codex_home / "plugins" / "cache" / market_name / PLUGIN_NAME,
+            target_root / "plugins" / PLUGIN_DIR_NAME,
+            codex_home / "skills" / SKILL_NAME,
+            codex_home / "plugins" / "cache" / market_name / PLUGIN_ID,
+            codex_home
+            / "plugins"
+            / "cache"
+            / LEGACY_MARKETPLACE_NAME
+            / LEGACY_PLUGIN_ID,
         ):
             if path.exists() or path.is_symlink():
                 remove_path(path)
 
-    remove_config_sections(codex_home, market_name)
-    print(f"Uninstalled {PLUGIN_NAME} from {target_root}.")
+    remove_config_sections(codex_home, PLUGIN_ID, market_name)
+    remove_config_sections(codex_home, LEGACY_PLUGIN_ID, LEGACY_MARKETPLACE_NAME)
+    print(f"Uninstalled {PRODUCT_NAME} from {target_root}.")
     print("Restart Codex to unload plugin hooks.")
 
 

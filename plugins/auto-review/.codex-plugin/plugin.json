@@ -1,6 +1,6 @@
 {
-  "name": "auto-review",
-  "version": "0.2.0",
+  "name": "review-runtime",
+  "version": "0.2.0+codex.20260721182055",
   "description": "Opt-in Codex plugin that uses Stop hooks to review a completed task, detect structured review findings, fix them, and repeat review until clean.",
   "author": {
     "name": "wuyr"
@@ -12,10 +12,9 @@
     "review",
     "automation"
   ],
-  "hooks": "./hooks/hooks.json",
   "interface": {
-    "displayName": "Auto Review",
-    "shortDescription": "Automatically review and repair Codex task changes after Stop.",
+    "displayName": "Review Runtime",
+    "shortDescription": "Runs the Auto Review lifecycle hooks after Stop.",
     "longDescription": "Use the global $auto-review skill to arm an opt-in Stop hook. When the task finishes, the hook asks Codex to review the latest changes, parses a required structured result, and asks Codex to fix and review again when real issues are found.",
     "developerName": "wuyr",
     "category": "Productivity",

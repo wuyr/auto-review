@@ -1,112 +1,103 @@
 ---
 name: auto-review
-description: Use when the user wants Codex to automatically run a comprehensive, risk-calibrated review of the current task after completion and, if the review finds real issues, fix them and review again. Trigger with the explicit opt-in prompt "$auto-review".
+description: Use when the user wants Codex to automatically run a scope-aware review of task changes or current uncommitted changes, apply proportionate fixes, and stop cleanly or request replanning when automatic repair would expand the task. Trigger with the explicit opt-in prompt "$auto-review".
 ---
 
 # Auto Review
 
 ## Workflow
 
-When this skill is used, continue the user's requested coding task normally. The plugin hook arms the session on the activating prompt; do not manually run the review prompt while doing the main task.
+Use `$auto-review` to opt in. The plugin hook arms the session; do not manually submit the hook's review or fix prompts.
 
-Use `$auto-review` to opt in to the automatic review loop.
-
-For ordinary implementation tasks, put `$auto-review` in the task prompt:
+For an implementation task, include the marker in the task prompt:
 
 ```text
 $auto-review 按这个需求实现...
 ```
 
-For `/plan` first workflows, keep the same single entrypoint in the initial planning request:
+For a standalone review, either form reviews current uncommitted changes:
 
 ```text
-/plan
-$auto-review 为这个需求制定计划：...
+$auto-review 检查一下
 ```
-
-When `/plan` returns a final response containing `<proposed_plan>`, the hook defers review instead of reviewing the plan itself. After the user clicks “实现计划”, clicks “清除当前上下文然后实现计划”, or otherwise asks to implement the plan, the hook runs auto-review when that implementation phase stops. If clearing context creates a new session, the hook can continue the deferred plan through a cwd-scoped handoff. If the original plan session receives an unrelated ordinary prompt while review is deferred after a plan, the hook cancels that deferred state; unrelated prompts in other sessions for the same cwd do not cancel it.
-
-For `/goal` workflows, include `$auto-review` in the goal objective:
 
 ```text
-/goal $auto-review 完成这个目标，完成后自动 review
+$auto-review
 ```
 
-The hook does not review intermediate goal-continuation turns. When the goal is marked `complete`, the Stop hook reads the goal objective from the transcript and starts the review loop once.
+Perform a standalone review in the activating turn and return the structured result directly; the hook consumes it without scheduling a duplicate pass. If no structured result is returned, the Stop hook submits the discovery prompt as a fallback.
 
-At Stop, the hook will submit this review prompt:
+Use the nearest substantive task in the same session as the requirement basis. If it is unavailable, review only code-supported logic, regression, compatibility, security, and test problems; do not infer missing requirements. A clean worktree has no standalone review target, so the hook skips the loop.
 
-```text
-review本次修改，检查是否存在遗漏，逻辑错误等问题
-```
+For `/plan`, put `$auto-review` in the initial planning request. The hook defers review when the plan output contains `<proposed_plan>`, then reviews the implementation after the user starts it. A cwd-scoped handoff preserves this intent when implementation starts in a new session. An unrelated prompt in the originating session cancels the deferred state.
 
-If that review reports real issues through the required structured marker, the hook will submit this fix prompt:
+For `/goal`, include `$auto-review` in the objective. Do not review intermediate continuation turns; start after the goal is marked `complete`.
 
-```text
-修复这些问题然后重新做一次review
-```
+## Review Target and Authority
 
-After the fix pass ends, the hook automatically submits another review prompt. The loop ends when the review result says there are no issues.
+For implementation prompts, review changes produced by the activating task against the original request and repository contracts that existed before the task. For standalone prompts, review the current uncommitted changes using the nearest recoverable task basis.
 
-## Convergent Review Protocol
+Treat documents, schemas, tests, and guarantees added by the reviewed diff as implementation choices. They do not become independent requirements merely because an earlier automatic fix added them. A blocking finding must be supported by an explicit request, a pre-task contract, a regression caused by the task, or a reachable supported-path failure.
 
-Make each automatic review a complete convergence pass. Do not stop after finding the first issue or intentionally save findings for later rounds.
+## Review Stages
 
-Before producing the result:
+Use an asymmetric convergence flow:
 
-1. Reconstruct the requested behavior and inspect the cumulative task changes, not only the latest patch.
-2. Derive the important invariants from the request, diff, affected callers, contracts, and tests.
-3. Check requirements and logic/data flow; then check sibling call sites, symmetric branches, state combinations, boundaries, and error paths; then check regressions and meaningful test gaps.
-4. After finding an issue, search for every supported-path variant of the same root cause. Group variants into one finding when one root-cause fix should close them, and list all affected locations in its evidence.
-5. Perform a final sweep before returning the marker. Report every substantiated issue available now; do not cap the list at one or two for brevity.
+1. `discovery`: inspect the target once and report all substantiated issues available in that pass. Group supported variants when one root-cause fix should close them.
+2. `fix`: repair only the reported issues with the smallest proportionate change.
+3. `closure`: verify the reported issues, the fix diff, direct callers, original-requirement closure, and directly affected cross-boundary contracts. Do not reopen a general hunt over all cumulative changes.
 
-Measure completeness by review coverage, never by the number of findings. Require no minimum finding count. If the complete pass supports only zero, one, or two real issues, return exactly that number; never invent marginal findings to make the review appear thorough.
+Treat `action=clean` as terminal in every review stage. The hook must end the loop immediately and must not schedule an additional final review.
 
-On review rounds after a fix, first verify that the previous findings are closed at the root cause, then repeat the complete pass over all cumulative changes. Report a new finding only when the defect still exists or the fix introduced it; do not create findings by progressively tightening an unstated contract.
+The hook permits at most two automatic fix generations. An identical finding after a fix or an exhausted fix budget pauses automation without claiming the review is clean. Python enforces only these deterministic execution guards; the model retains semantic responsibility for deciding whether an issue is real, in scope, fixable, or requires replanning.
 
-## Risk Calibration
+## Risk and Decision Calibration
 
-Mark an item as an issue only when all of these hold:
+Report a blocking issue only when its supported trigger is reachable, its impact is material, direct evidence supports it, and the proposed response is proportionate to the original task. Do not block on style preferences, speculative hardening, unsupported inputs, purely theoretical races, or contracts invented by the current review loop.
 
-- Its trigger is reachable through supported usage or an explicitly stated threat model.
-- Its impact on correctness, security, data, compatibility, or user-visible behavior is material.
-- Code, a deterministic reproduction, a failing test, or an established contract directly supports it.
-- The proposed fix is proportionate to the risk and remains within the task's scope.
+Before choosing a response, compare these options in order:
 
-Do not dismiss a low-frequency path merely because it is rare when the trigger is credible and the impact is high. Conversely, do not require defenses for unsupported inputs, purely theoretical races, arbitrary synchronized tampering with multiple trusted artifacts, or other adversary capabilities outside the stated threat model. Treat style preferences, speculative hardening, broad refactors, and defense-in-depth ideas as non-blocking unless the user explicitly requested them.
+1. Remove the newly introduced mechanism.
+2. Restore the prior supported behavior.
+3. Apply a local fix within the task and its direct callers.
+4. Add new architecture or broaden the contract.
 
-For security work, derive the attacker capabilities and trust boundaries from the request and repository contracts. Do not silently strengthen that model during later review rounds.
+Use `fix` only when a proportionate in-scope minimum exists. Use `needs_replan` when the issue is real but a reasonable solution requires new architecture, a broader contract, or a material change to the requested design. Use `clean` only when no blocking issue remains.
 
-## Root-Cause Fix Protocol
+## Fix Protocol
 
-During an automatic fix pass:
-
-1. Translate each finding into the violated invariant and identify its root cause before editing.
-2. Search for and repair affected sibling call sites, symmetric branches, equivalent states, and boundaries instead of patching only the supplied reproduction.
-3. Add focused regression coverage for the relevant equivalence classes when practical.
-4. Before stopping, self-review the cumulative fix and test results and repair concrete regressions introduced by the fix.
-5. Keep the same supported-use and threat-model boundary; do not expand the task into theoretical hardening.
+Fix only the enumerated issues and direct same-root-cause equivalents inside the original scope. Add focused regression coverage when practical. Do not add a schema, public state machine, lifecycle, or broad refactor merely to satisfy a contract introduced by the automatic review itself. If no scoped minimum exists, leave the architecture unchanged so the next review can return `needs_replan`.
 
 ## Review Output Contract
 
-During the automatic review phase, finish with exactly one `auto_review_result` block:
+Finish every automatic review phase with exactly one `auto_review_result` block.
+
+When clean:
 
 ```text
 <auto_review_result>
-{"issues_found":true,"issues":[{"summary":"问题摘要","evidence":"位置、可达触发、错误行为与实际影响","fix_hint":"修复建议"}]}
+{"action":"clean","issues":[]}
 </auto_review_result>
 ```
 
-Use this clean result when no real issue exists:
+When a scoped automatic fix exists:
 
 ```text
 <auto_review_result>
-{"issues_found":false,"issues":[]}
+{"action":"fix","issues":[{"summary":"问题摘要","evidence":"位置、可达触发、错误行为与实际影响","requirement_basis":"原始需求、修改前合同或任务回归","minimal_fix":"范围内最小修复","why_in_scope":"为何属于本任务"}]}
 </auto_review_result>
 ```
 
-Keep each finding concise, but make its evidence state the affected location, reachable trigger, incorrect behavior, and material impact. Only set `issues_found` to `true` for findings that pass the risk-calibration gate above.
+When a real issue needs design authority beyond the task:
+
+```text
+<auto_review_result>
+{"action":"needs_replan","issues":[{"summary":"问题摘要","evidence":"位置、可达触发、错误行为与实际影响","requirement_basis":"原始需求、修改前合同或任务回归","minimal_fix":"说明为何范围内没有合理最小修复","why_in_scope":"为何问题真实且与本任务相关"}]}
+</auto_review_result>
+```
+
+The hook accepts the legacy `issues_found` result for in-flight compatibility, but new review output must use `action`.
 
 ## Recursion Guard
 
-Do not invoke `$auto-review` inside the automatic review or fix prompts. Those prompts contain internal sentinels that the hook uses to avoid recursive arming.
+Do not invoke `$auto-review` inside automatic review or fix prompts. Internal sentinels prevent recursive arming.

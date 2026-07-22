@@ -2,7 +2,7 @@
 
 中文 | [English version](README.en.md)
 
-顾名思义，当你在提交修改代码相关prompt时使用这个skill，它就会在codex**完成修改后**对`本轮修改的文件`**主动发起review**，如果发现问题，会**自动做修复**，修复后会**重做review**，直到检测不到问题为止。每轮 review 会先做一次收敛式全量扫描，尽量一次找全同根因和相邻路径的问题；修复时也会按根因检查同类位置，减少连续多轮每次只出现少量 finding 的情况。
+顾名思义，在修改文件相关的 prompt 中使用这个 skill 后，Codex 会在**完成修改后**主动 review `本次任务的修改`。如发现问题，会在原任务范围内做**循环repair + review**（最多两轮）。
 
 ## 使用方式
 
@@ -16,6 +16,14 @@ $auto-review 修复xxx问题
 ```text
 $auto-review 新增xxx功能
 ```
+
+也可以只输入：
+
+```text
+$auto-review
+```
+
+这个用法会优先review当前会话最近的实质修改任务。
 
 skill已适配 `/plan` 和 `/goal` 。
 
@@ -58,7 +66,7 @@ Windows默认为 copy 模式（直接复制文件），如果要使用 symlink �
 .\install.ps1 -Mode symlink
 ```
 
-安装后重启 Codex。
+安装或更新后，需要完整退出并重启 Codex。仅新建或 fork session 不会生效。
 
 ## 卸载
 
@@ -78,14 +86,11 @@ cd C:\path\to\auto-review
 
 ## 实现原理
 
-利用Codex提供的hook机制监听任务的`Stop`信号， 然后自动提交一条prompt：
+利用Codex提供的hook机制监听任务的`Stop`信号，然后自动发起review：
 ```text
-review本次修改，检查是否存在遗漏，逻辑错误等问题……请完成全量扫描，不要发现首个问题就停止
+review本次修改，检查是否存在遗漏，逻辑错误等问题
 ```
-当这条prompt完成后，如果发现有问题，会继续提交prompt:
+如果没有发现问题，review会直接结束。如果问题能在原任务范围内解决，会自动提交：
 ```text
-请修复这些问题
+修复这些问题然后重新做一次review
 ```
-这个过程会一直循环，直到review后找不到新的问题为止。
-
-**注意：** 这个review的范围是使用skill那一轮修改所涉及到的文件，并不会额外对所有本地修改或当前分支做review。

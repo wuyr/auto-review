@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -83,6 +84,37 @@ class CodexCommandResolutionTest(unittest.TestCase):
             str(raised.exception),
             "Error: Codex CLI is required, but 'codex' was not found in PATH.",
         )
+
+
+class InstallPathSafetyTest(unittest.TestCase):
+    def test_force_replaces_existing_source_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plugin_source = root / "source" / "plugins" / installer.PLUGIN_DIR_NAME
+            skill_source = root / "source" / "skills" / installer.SKILL_NAME
+            plugin_source.mkdir(parents=True)
+            skill_source.mkdir(parents=True)
+
+            codex_home = root / "codex-home"
+            plugin_dest = codex_home / "plugins" / installer.PLUGIN_DIR_NAME
+            skill_dest = codex_home / "skills" / installer.SKILL_NAME
+            plugin_dest.parent.mkdir(parents=True)
+            skill_dest.parent.mkdir(parents=True)
+            plugin_dest.symlink_to(plugin_source, target_is_directory=True)
+            skill_dest.symlink_to(skill_source, target_is_directory=True)
+
+            installer.install_plugin_and_skill(
+                {"plugin": plugin_source, "skill": skill_source},
+                codex_home,
+                codex_home,
+                "symlink",
+                True,
+            )
+
+            self.assertTrue(plugin_dest.is_symlink())
+            self.assertTrue(skill_dest.is_symlink())
+            self.assertEqual(plugin_dest.resolve(), plugin_source.resolve())
+            self.assertEqual(skill_dest.resolve(), skill_source.resolve())
 
 
 if __name__ == "__main__":

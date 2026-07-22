@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -c \"import os,runpy,sys; roots=[os.environ.get('CODEX_PLUGIN_ROOT'),os.environ.get('CLAUDE_PLUGIN_ROOT'),os.getcwd(),os.path.join(os.getcwd(),'plugins','auto-review')]; script=next((os.path.join(r,'hooks','auto_review_hook.py') for r in roots if r and os.path.exists(os.path.join(r,'hooks','auto_review_hook.py'))),None); sys.exit(0) if script is None else runpy.run_path(script, run_name='__main__')\"",
+            "command": "python3 -c \"import os,runpy,sys; codex_home=os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'),'.codex'); roots=[os.environ.get('CODEX_PLUGIN_ROOT'),os.environ.get('CLAUDE_PLUGIN_ROOT'),os.path.join(codex_home,'plugins','auto-review'),os.getcwd(),os.path.join(os.getcwd(),'plugins','auto-review')]; script=next((os.path.join(r,'hooks','auto_review_hook.py') for r in roots if r and os.path.exists(os.path.join(r,'hooks','auto_review_hook.py'))),None); sys.exit(0) if script is None else runpy.run_path(script, run_name='__main__')\"",
             "timeout": 5
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -c \"import os,runpy,sys; roots=[os.environ.get('CODEX_PLUGIN_ROOT'),os.environ.get('CLAUDE_PLUGIN_ROOT'),os.getcwd(),os.path.join(os.getcwd(),'plugins','auto-review')]; script=next((os.path.join(r,'hooks','auto_review_hook.py') for r in roots if r and os.path.exists(os.path.join(r,'hooks','auto_review_hook.py'))),None); sys.exit(0) if script is None else runpy.run_path(script, run_name='__main__')\"",
+            "command": "python3 -c \"import os,runpy,sys; codex_home=os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'),'.codex'); roots=[os.environ.get('CODEX_PLUGIN_ROOT'),os.environ.get('CLAUDE_PLUGIN_ROOT'),os.path.join(codex_home,'plugins','auto-review'),os.getcwd(),os.path.join(os.getcwd(),'plugins','auto-review')]; script=next((os.path.join(r,'hooks','auto_review_hook.py') for r in roots if r and os.path.exists(os.path.join(r,'hooks','auto_review_hook.py'))),None); sys.exit(0) if script is None else runpy.run_path(script, run_name='__main__')\"",
             "timeout": 30
           }
         ]

@@ -1,6 +1,6 @@
 # Auto Review (for Codex)
 
-As the name suggests, when you use this skill in a code-change prompt, it will automatically start a review of the files modified in the current turn after Codex finishes making changes. If issues are found, it will automatically fix them, then run another review. The loop continues until no issues are detected. Each review performs a convergent full pass that searches for sibling cases of the same root cause, and each fix pass checks equivalent affected paths, reducing long chains of rounds that surface only one or two findings at a time.
+As the name suggests, when you use this skill in a prompt that modifies files, Codex automatically reviews `the task's changes` after it finishes. If it finds issues, it runs a **repair + review loop** within the original task's scope (up to two rounds).
 
 ## Usage
 
@@ -15,6 +15,14 @@ $auto-review Fix the xxx issue
 ```text
 $auto-review Add the xxx feature
 ```
+
+Or simply use:
+
+```text
+$auto-review
+```
+
+This form first reviews the most recent substantive task involving file changes in the current session.
 
 The skill supports `/plan`, `/goal`.
 
@@ -55,7 +63,7 @@ Windows defaults to copy mode. To use symlink mode, enable Windows Developer Mod
 .\install.ps1 -Mode symlink
 ```
 
-Restart Codex after installation.
+Fully quit and restart Codex after installation or updates. Creating or forking a session without restarting will not apply the changes.
 
 ## Uninstallation
 
@@ -75,20 +83,14 @@ cd C:\path\to\auto-review
 
 ## How It Works
 
-It uses the hook mechanism provided by Codex to listen for the task `Stop` signal, then automatically submits a prompt:
+It uses the hook mechanism provided by Codex to listen for the task `Stop` signal, then automatically starts a review:
 
 ```text
-Review the changes from this turn, perform a complete pass, and do not stop after the first issue.
+Review the task changes for omissions and logic errors.
 ```
 
-After that prompt finishes, if issues are found, it continues by submitting another prompt:
+If no issues are found, the review ends immediately. If an issue can be fixed within the original task, Codex submits:
 
 ```text
-Please fix these issues.
+Please fix these issues, then review again.
 ```
-
-This process keeps looping until the review can no longer find new issues.
-
-The review treats a defect as a finding only when it is reachable within supported usage or the explicit threat model, has material impact, and is backed by direct evidence. Rare but credible, high-impact defects still count; theoretical attacks outside the stated threat model, scenarios requiring arbitrary rewrites of multiple trusted artifacts, style preferences, and extra hardening do not block the loop. There is no minimum finding count: completeness is measured by coverage, so a review with only zero, one, or two real issues must report exactly that number without padding the result.
-
-**Note:** The review scope is limited to the files touched by the turn where the skill was used. It does not additionally review all local changes or the whole current branch.
