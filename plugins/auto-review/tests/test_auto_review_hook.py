@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,19 @@ FIX_SENTINEL = "<!-- auto-review:fix -->"
 PROPOSED_PLAN = "<proposed_plan>\n1. Inspect the code.\n2. Implement the fix.\n</proposed_plan>"
 
 
+def local_hook_command(event_name: str) -> str:
+    config = json.loads(HOOKS_CONFIG.read_text(encoding="utf-8"))
+    command = config["hooks"][event_name][0]["hooks"][0]["command"]
+    if not command.startswith("python3 -c "):
+        raise AssertionError(f"Unexpected hook command: {command}")
+    executable = (
+        subprocess.list2cmdline([sys.executable])
+        if os.name == "nt"
+        else shlex.quote(sys.executable)
+    )
+    return executable + " -c " + command[len("python3 -c ") :]
+
+
 class AutoReviewHookTest(unittest.TestCase):
     def test_bootstrap_falls_back_when_loaded_cache_root_was_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -35,8 +49,7 @@ class AutoReviewHookTest(unittest.TestCase):
             stable_hooks.mkdir(parents=True)
             shutil.copy2(HOOK, stable_hooks / HOOK.name)
 
-            config = json.loads(HOOKS_CONFIG.read_text(encoding="utf-8"))
-            command = config["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            command = local_hook_command("UserPromptSubmit")
             payload = {
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": "stale-cache-session",
@@ -59,13 +72,14 @@ class AutoReviewHookTest(unittest.TestCase):
                 cwd=workspace,
                 shell=True,
                 check=False,
+                encoding="utf-8",
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("auto_review_armed", result.stdout)
             self.assertTrue((state_home / "state" / "stale-cache-session.json").exists())
 
-            stop_command = config["hooks"]["Stop"][0]["hooks"][0]["command"]
+            stop_command = local_hook_command("Stop")
             stop_payload = {
                 "hook_event_name": "Stop",
                 "session_id": "stale-cache-session",
@@ -80,6 +94,7 @@ class AutoReviewHookTest(unittest.TestCase):
                 cwd=workspace,
                 shell=True,
                 check=False,
+                encoding="utf-8",
             )
 
             self.assertEqual(stop_result.returncode, 0, stop_result.stderr)
@@ -109,6 +124,7 @@ class AutoReviewHookTest(unittest.TestCase):
             env=env,
             cwd=str(cwd) if cwd is not None else None,
             check=False,
+            encoding="utf-8",
         )
 
     def transcript(self, root: Path, assistant_text: str) -> Path:
@@ -477,7 +493,8 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertEqual(events[-1]["event"], "armed")
 
     def test_state_home_falls_back_to_portable_temp_dir_without_git(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        temp_parent = os.environ.get("PUBLIC") if os.name == "nt" else None
+        with tempfile.TemporaryDirectory(dir=temp_parent) as temp:
             root = Path(temp)
             workspace = root / "workspace"
             workspace.mkdir()

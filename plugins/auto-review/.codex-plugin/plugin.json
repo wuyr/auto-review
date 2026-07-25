@@ -1,6 +1,6 @@
 {
   "name": "review-runtime",
-  "version": "0.2.0+codex.20260721182055",
+  "version": "0.2.0+codex.20260725202342",
   "description": "Opt-in Codex plugin that uses Stop hooks to review a completed task, detect structured review findings, fix them, and repeat review until clean.",
   "author": {
     "name": "wuyr"

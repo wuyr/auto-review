@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,47 @@ assert SPEC is not None
 assert SPEC.loader is not None
 installer = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(installer)
+
+
+def hooks_payload() -> dict:
+    command = 'python3 -c "auto_review_hook.py"'
+    return {
+        "hooks": {
+            event_name: [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": command}],
+                }
+            ]
+            for event_name in installer.HOOK_EVENTS
+        }
+    }
+
+
+def write_hooks(plugin_root: Path) -> None:
+    hooks = plugin_root / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "hooks.json").write_text(
+        json.dumps(hooks_payload()),
+        encoding="utf-8",
+    )
+    (hooks / "auto_review_hook.py").write_text("pass\n", encoding="utf-8")
+
+
+def supports_directory_symlinks() -> bool:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source = root / "source"
+        target = root / "target"
+        source.mkdir()
+        try:
+            target.symlink_to(source, target_is_directory=True)
+        except OSError:
+            return False
+        return target.is_symlink()
+
+
+SYMLINKS_SUPPORTED = supports_directory_symlinks()
 
 
 class CodexCommandResolutionTest(unittest.TestCase):
@@ -86,13 +128,175 @@ class CodexCommandResolutionTest(unittest.TestCase):
         )
 
 
+class HookPythonConfigurationTest(unittest.TestCase):
+    def test_windows_hook_uses_quoted_installer_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugin_root = Path(temp_dir) / "plugin"
+            write_hooks(plugin_root)
+
+            executable = r"C:\Program Files\Python312\python.exe"
+            installer.configure_hook_python(plugin_root, executable, platform_name="nt")
+
+            payload = json.loads(
+                (plugin_root / "hooks" / "hooks.json").read_text(encoding="utf-8")
+            )
+            for event_name in installer.HOOK_EVENTS:
+                command = payload["hooks"][event_name][0]["hooks"][0]["command"]
+                self.assertTrue(command.startswith(f'"{executable}" -c '), command)
+                self.assertNotIn("python3 -c", command)
+
+    def test_posix_hook_shell_quotes_installer_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugin_root = Path(temp_dir) / "plugin"
+            write_hooks(plugin_root)
+
+            installer.configure_hook_python(
+                plugin_root,
+                "/opt/Python Runtime/bin/python3",
+                platform_name="posix",
+            )
+
+            payload = json.loads(
+                (plugin_root / "hooks" / "hooks.json").read_text(encoding="utf-8")
+            )
+            command = payload["hooks"]["Stop"][0]["hooks"][0]["command"]
+            self.assertTrue(command.startswith("'/opt/Python Runtime/bin/python3' -c "), command)
+
+
+class MarketplaceCompatibilityTest(unittest.TestCase):
+    def test_existing_marketplace_name_drives_plugin_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_marketplace = root / "source-marketplace.json"
+            source_marketplace.write_text(
+                json.dumps({"name": "review-runtime-local", "plugins": []}),
+                encoding="utf-8",
+            )
+            target_root = root / "codex-home"
+            target_marketplace = target_root / ".agents" / "plugins" / "marketplace.json"
+            target_marketplace.parent.mkdir(parents=True)
+            target_marketplace.write_text(
+                json.dumps(
+                    {
+                        "name": "local",
+                        "interface": {"displayName": "Local Plugins"},
+                        "plugins": [{"name": "carry-on"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            market_name = installer.write_or_link_marketplace(
+                {"marketplace": source_marketplace},
+                target_root,
+                "copy",
+            )
+
+            self.assertEqual(market_name, "local")
+            payload = json.loads(target_marketplace.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [entry["name"] for entry in payload["plugins"]],
+                ["carry-on", installer.PLUGIN_ID],
+            )
+
+    def test_shared_marketplace_config_is_preserved_on_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            config = codex_home / "config.toml"
+            config.write_text(
+                "[marketplaces.local]\nsource = 'local'\n\n"
+                '[plugins."review-runtime@local"]\nenabled = true\n\n'
+                '[hooks.state."review-runtime@local:hooks/hooks.json:stop:0:0"]\n'
+                'trusted_hash = "sha256:test"\n\n'
+                '[plugins."carry-on@local"]\nenabled = true\n',
+                encoding="utf-8",
+            )
+
+            installer.remove_config_sections(
+                codex_home,
+                installer.PLUGIN_ID,
+                "local",
+                remove_marketplace=False,
+            )
+
+            updated = config.read_text(encoding="utf-8")
+            self.assertIn("[marketplaces.local]", updated)
+            self.assertIn('[plugins."carry-on@local"]', updated)
+            self.assertNotIn("review-runtime@local", updated)
+
+    def test_uninstall_keeps_shared_target_marketplace_registered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project_root = root / "source"
+            source_marketplace = project_root / ".agents" / "plugins" / "marketplace.json"
+            source_marketplace.parent.mkdir(parents=True)
+            source_marketplace.write_text(
+                json.dumps({"name": "review-runtime-local", "plugins": []}),
+                encoding="utf-8",
+            )
+
+            codex_home = root / "codex-home"
+            target_marketplace = codex_home / ".agents" / "plugins" / "marketplace.json"
+            target_marketplace.parent.mkdir(parents=True)
+            target_marketplace.write_text(
+                json.dumps(
+                    {
+                        "name": "local",
+                        "plugins": [
+                            {"name": "carry-on"},
+                            {"name": installer.PLUGIN_ID},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = installer.argparse.Namespace(
+                project_root=str(project_root),
+                target_root=str(codex_home),
+                codex_home=str(codex_home),
+                keep_files=True,
+            )
+
+            with (
+                mock.patch.object(installer, "find_codex_command", return_value="codex"),
+                mock.patch.object(installer, "run_command") as run_command,
+                mock.patch("builtins.print"),
+            ):
+                installer.uninstall(args)
+
+            commands = [call.args[0] for call in run_command.call_args_list]
+            self.assertIn(
+                ["codex", "plugin", "remove", f"{installer.PLUGIN_ID}@local"],
+                commands,
+            )
+            self.assertNotIn(
+                ["codex", "plugin", "marketplace", "remove", "local"],
+                commands,
+            )
+            payload = json.loads(target_marketplace.read_text(encoding="utf-8"))
+            self.assertEqual([entry["name"] for entry in payload["plugins"]], ["carry-on"])
+
+
+class AppServerResponseTest(unittest.TestCase):
+    def test_response_queue_works_for_pipe_reader_output(self) -> None:
+        responses = installer.queue.Queue()
+        responses.put('{"method":"notification"}\n')
+        responses.put('{"id":7,"result":{"status":"ok"}}\n')
+
+        self.assertEqual(
+            installer.app_server_request(responses, 7, timeout_seconds=0.1),
+            {"status": "ok"},
+        )
+
+
 class InstallPathSafetyTest(unittest.TestCase):
+    @unittest.skipUnless(SYMLINKS_SUPPORTED, "directory symlinks are unavailable")
     def test_force_replaces_existing_source_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             plugin_source = root / "source" / "plugins" / installer.PLUGIN_DIR_NAME
             skill_source = root / "source" / "skills" / installer.SKILL_NAME
-            plugin_source.mkdir(parents=True)
+            write_hooks(plugin_source)
             skill_source.mkdir(parents=True)
 
             codex_home = root / "codex-home"
@@ -109,12 +313,19 @@ class InstallPathSafetyTest(unittest.TestCase):
                 codex_home,
                 "symlink",
                 True,
+                r"C:\Python312\python.exe",
             )
 
-            self.assertTrue(plugin_dest.is_symlink())
+            self.assertFalse(plugin_dest.is_symlink())
             self.assertTrue(skill_dest.is_symlink())
-            self.assertEqual(plugin_dest.resolve(), plugin_source.resolve())
             self.assertEqual(skill_dest.resolve(), skill_source.resolve())
+            self.assertFalse((plugin_dest / "hooks" / "hooks.json").is_symlink())
+            self.assertTrue((plugin_dest / "hooks" / "auto_review_hook.py").is_symlink())
+            configured = json.loads(
+                (plugin_dest / "hooks" / "hooks.json").read_text(encoding="utf-8")
+            )
+            command = configured["hooks"]["Stop"][0]["hooks"][0]["command"]
+            self.assertNotIn("python3 -c", command)
 
 
 if __name__ == "__main__":

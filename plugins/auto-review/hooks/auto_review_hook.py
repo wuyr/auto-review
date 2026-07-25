@@ -44,6 +44,11 @@ _STATE_BASE_CACHE: dict[str, Path] = {}
 
 
 def portable_home() -> Path | None:
+    preferred_variables = ("USERPROFILE", "HOME") if os.name == "nt" else ("HOME",)
+    for variable in preferred_variables:
+        value = os.environ.get(variable)
+        if value and value.strip():
+            return Path(value).expanduser()
     try:
         return Path.home()
     except RuntimeError:

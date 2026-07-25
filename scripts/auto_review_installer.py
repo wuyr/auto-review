@@ -6,13 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import selectors
+import queue
+import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 PRODUCT_NAME = "auto-review"
@@ -25,6 +27,7 @@ LEGACY_PLUGIN_ID = "auto-review"
 LEGACY_MARKETPLACE_NAME = "auto-review-local"
 OWNED_PLUGIN_IDS = frozenset((PLUGIN_ID, LEGACY_PLUGIN_ID))
 HOOK_EVENTS = ("UserPromptSubmit", "Stop")
+HOOK_PYTHON_PREFIX = "python3 -c "
 
 
 def fail(message: str) -> None:
@@ -88,6 +91,8 @@ def run_command(
         args,
         env=command_env(codex_home),
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -181,12 +186,87 @@ def copy_or_link(source: Path, dest: Path, mode: str) -> None:
             shutil.copy2(source, dest)
 
 
+def shell_quote_executable(executable: str, platform_name: str | None = None) -> str:
+    platform = platform_name or os.name
+    if platform == "nt":
+        return subprocess.list2cmdline([executable])
+    return shlex.quote(executable)
+
+
+def configure_hook_python(
+    plugin_root: Path,
+    python_executable: str,
+    platform_name: str | None = None,
+) -> None:
+    hooks_path = plugin_root / "hooks" / "hooks.json"
+    payload = read_json(hooks_path, "installed hooks.json")
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        fail(f"installed hooks.json must contain a top-level hooks object: {hooks_path}")
+
+    command_prefix = shell_quote_executable(python_executable, platform_name)
+    configured = 0
+    for event_name in HOOK_EVENTS:
+        entries = hooks.get(event_name)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            commands = entry.get("hooks")
+            if not isinstance(commands, list):
+                continue
+            for hook in commands:
+                if not isinstance(hook, dict):
+                    continue
+                command = hook.get("command")
+                if not isinstance(command, str) or "auto_review_hook.py" not in command:
+                    continue
+                if not command.startswith(HOOK_PYTHON_PREFIX):
+                    fail(
+                        "auto-review hook command must start with "
+                        f"{HOOK_PYTHON_PREFIX!r}: {hooks_path}"
+                    )
+                hook["command"] = command_prefix + " -c " + command[len(HOOK_PYTHON_PREFIX) :]
+                configured += 1
+
+    if configured < len(HOOK_EVENTS):
+        fail(f"Expected to configure at least {len(HOOK_EVENTS)} auto-review hooks in {hooks_path}")
+    write_json(hooks_path, payload)
+
+
+def link_plugin_with_materialized_hooks(source: Path, dest: Path) -> None:
+    dest.mkdir(parents=True)
+    for child in source.iterdir():
+        if child.name == "hooks":
+            continue
+        os.symlink(child, dest / child.name, target_is_directory=child.is_dir())
+
+    hooks_source = source / "hooks"
+    hooks_dest = dest / "hooks"
+    hooks_dest.mkdir()
+    for child in hooks_source.iterdir():
+        target = hooks_dest / child.name
+        if child.name == "hooks.json":
+            shutil.copy2(child, target)
+        else:
+            os.symlink(child, target, target_is_directory=child.is_dir())
+
+
+def install_plugin(source: Path, dest: Path, mode: str) -> None:
+    if mode == "symlink":
+        link_plugin_with_materialized_hooks(source, dest)
+    else:
+        shutil.copytree(source, dest)
+
+
 def install_plugin_and_skill(
     paths: dict[str, Path],
     target_root: Path,
     codex_home: Path,
     mode: str,
     force: bool,
+    python_executable: str | None = None,
 ) -> None:
     plugin_dest = target_root / "plugins" / PLUGIN_DIR_NAME
     skill_dest = codex_home / "skills" / SKILL_NAME
@@ -204,12 +284,16 @@ def install_plugin_and_skill(
 
     (target_root / "plugins").mkdir(parents=True, exist_ok=True)
     (codex_home / "skills").mkdir(parents=True, exist_ok=True)
-    copy_or_link(paths["plugin"], plugin_dest, mode)
+    install_plugin(paths["plugin"], plugin_dest, mode)
     copy_or_link(paths["skill"], skill_dest, mode)
+    configure_hook_python(
+        plugin_dest,
+        python_executable or str(resolved(Path(sys.executable))),
+    )
 
 
 def target_marketplace_has_other_plugins(marketplace_path: Path) -> bool:
-    if not marketplace_path.exists() or marketplace_path.is_symlink():
+    if not marketplace_path.exists():
         return False
     payload = read_json(marketplace_path, "existing marketplace.json")
     plugins = payload.get("plugins")
@@ -236,7 +320,7 @@ def write_or_link_marketplace(
     paths: dict[str, Path],
     target_root: Path,
     mode: str,
-) -> None:
+) -> str:
     marketplace_path = target_root / ".agents" / "plugins" / "marketplace.json"
     marketplace_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -244,7 +328,7 @@ def write_or_link_marketplace(
         if marketplace_path.exists() or marketplace_path.is_symlink():
             remove_path(marketplace_path)
         os.symlink(paths["marketplace"], marketplace_path)
-        return
+        return marketplace_name(marketplace_path)
 
     if marketplace_path.exists() and not marketplace_path.is_symlink():
         payload = read_json(marketplace_path, "existing marketplace.json")
@@ -255,7 +339,9 @@ def write_or_link_marketplace(
             "plugins": [],
         }
 
-    payload.setdefault("name", marketplace_name(paths["marketplace"]))
+    current_name = payload.get("name")
+    if not isinstance(current_name, str) or not current_name.strip():
+        payload["name"] = marketplace_name(paths["marketplace"])
     interface = payload.setdefault("interface", {})
     if not isinstance(interface, dict):
         payload["interface"] = {"displayName": "Local Plugins"}
@@ -271,6 +357,7 @@ def write_or_link_marketplace(
     ]
     payload["plugins"].append(auto_review_marketplace_entry())
     write_json(marketplace_path, payload)
+    return marketplace_name(marketplace_path)
 
 
 def without_auto_review_hooks(entries: Any) -> list[Any]:
@@ -328,12 +415,12 @@ def cache_root(codex_home: Path, market_name: str, version: str) -> Path:
     return codex_home / "plugins" / "cache" / market_name / PLUGIN_ID / version
 
 
-def link_cache_contents(paths: dict[str, Path], cache_dest: Path) -> None:
+def link_cache_contents(plugin_root: Path, cache_dest: Path) -> None:
     if not cache_dest.is_dir():
         fail(f"Installed plugin cache was not found: {cache_dest}")
     for child in (".codex-plugin", "hooks", "tests"):
         dest = cache_dest / child
-        source = paths["plugin"] / child
+        source = plugin_root / child
         if not source.exists():
             continue
         if dest.exists() or dest.is_symlink():
@@ -341,29 +428,46 @@ def link_cache_contents(paths: dict[str, Path], cache_dest: Path) -> None:
         os.symlink(source, dest, target_is_directory=source.is_dir())
 
 
+def start_app_server_reader(stream: TextIO) -> queue.Queue[str | None]:
+    responses: queue.Queue[str | None] = queue.Queue()
+
+    def read_lines() -> None:
+        try:
+            for line in stream:
+                responses.put(line)
+        finally:
+            responses.put(None)
+
+    threading.Thread(
+        target=read_lines,
+        name="auto-review-app-server-reader",
+        daemon=True,
+    ).start()
+    return responses
+
+
 def app_server_request(
-    process: subprocess.Popen[str],
-    selector: selectors.BaseSelector,
+    responses: queue.Queue[str | None],
     request_id: int,
     timeout_seconds: float = 15.0,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
-    assert process.stdout is not None
     while time.monotonic() < deadline:
-        events = selector.select(timeout=max(0.1, deadline - time.monotonic()))
-        for key, _ in events:
-            line = key.fileobj.readline()
-            if not line:
-                break
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if payload.get("id") == request_id:
-                if "error" in payload:
-                    fail(f"Codex app-server request {request_id} failed: {payload['error']}")
-                result = payload.get("result")
-                return result if isinstance(result, dict) else {}
+        try:
+            line = responses.get(timeout=max(0.1, deadline - time.monotonic()))
+        except queue.Empty:
+            break
+        if line is None:
+            fail(f"Codex app-server closed before responding to request {request_id}.")
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("id") == request_id:
+            if "error" in payload:
+                fail(f"Codex app-server request {request_id} failed: {payload['error']}")
+            result = payload.get("result")
+            return result if isinstance(result, dict) else {}
     fail(f"Timed out waiting for Codex app-server response {request_id}.")
 
 
@@ -379,12 +483,13 @@ def trust_plugin_hooks(
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         env=command_env(codex_home),
     )
-    selector = selectors.DefaultSelector()
     assert process.stdout is not None
-    selector.register(process.stdout, selectors.EVENT_READ)
+    responses = start_app_server_reader(process.stdout)
 
     def send(payload: dict[str, Any]) -> None:
         assert process.stdin is not None
@@ -403,7 +508,7 @@ def trust_plugin_hooks(
                 },
             }
         )
-        app_server_request(process, selector, 1)
+        app_server_request(responses, 1)
         send({"jsonrpc": "2.0", "method": "initialized"})
         send(
             {
@@ -413,7 +518,7 @@ def trust_plugin_hooks(
                 "params": {"cwds": [str(project_root)]},
             }
         )
-        hooks_result = app_server_request(process, selector, 2)
+        hooks_result = app_server_request(responses, 2)
         trust_entries: dict[str, dict[str, str]] = {}
         warnings: list[str] = []
         for entry in hooks_result.get("data") or []:
@@ -456,7 +561,7 @@ def trust_plugin_hooks(
                 },
             }
         )
-        app_server_request(process, selector, 3)
+        app_server_request(responses, 3)
 
         send(
             {
@@ -466,7 +571,7 @@ def trust_plugin_hooks(
                 "params": {"cwds": [str(project_root)]},
             }
         )
-        verified = app_server_request(process, selector, 4)
+        verified = app_server_request(responses, 4)
         remaining_untrusted: list[str] = []
         for entry in verified.get("data") or []:
             if not isinstance(entry, dict):
@@ -501,8 +606,6 @@ def install(args: argparse.Namespace) -> None:
     target_root.mkdir(parents=True, exist_ok=True)
     codex_home.mkdir(parents=True, exist_ok=True)
 
-    market_name = marketplace_name(paths["marketplace"])
-    selector_name = f"{PLUGIN_ID}@{market_name}"
     legacy_selector = f"{LEGACY_PLUGIN_ID}@{LEGACY_MARKETPLACE_NAME}"
     run_command(
         [codex, "plugin", "remove", legacy_selector],
@@ -515,8 +618,16 @@ def install(args: argparse.Namespace) -> None:
         allow_failure=True,
     )
     remove_config_sections(codex_home, LEGACY_PLUGIN_ID, LEGACY_MARKETPLACE_NAME)
-    install_plugin_and_skill(paths, target_root, codex_home, args.mode, args.force)
-    write_or_link_marketplace(paths, target_root, args.mode)
+    install_plugin_and_skill(
+        paths,
+        target_root,
+        codex_home,
+        args.mode,
+        args.force,
+        str(resolved(Path(sys.executable))),
+    )
+    market_name = write_or_link_marketplace(paths, target_root, args.mode)
+    selector_name = f"{PLUGIN_ID}@{market_name}"
     cleanup_legacy_global_hooks(codex_home)
 
     run_command([codex, "plugin", "marketplace", "add", str(target_root)], codex_home)
@@ -524,7 +635,10 @@ def install(args: argparse.Namespace) -> None:
 
     version = plugin_version(paths["plugin"])
     if args.mode == "symlink":
-        link_cache_contents(paths, cache_root(codex_home, market_name, version))
+        link_cache_contents(
+            target_root / "plugins" / PLUGIN_DIR_NAME,
+            cache_root(codex_home, market_name, version),
+        )
 
     trust_plugin_hooks(codex_home, project_root, selector_name, codex)
 
@@ -556,7 +670,13 @@ def remove_marketplace_entry(target_root: Path, keep_files: bool) -> None:
         write_json(marketplace_path, payload)
 
 
-def remove_config_sections(codex_home: Path, plugin_id: str, market_name: str) -> None:
+def remove_config_sections(
+    codex_home: Path,
+    plugin_id: str,
+    market_name: str,
+    *,
+    remove_marketplace: bool = True,
+) -> None:
     config_path = codex_home / "config.toml"
     if not config_path.exists():
         return
@@ -565,10 +685,9 @@ def remove_config_sections(codex_home: Path, plugin_id: str, market_name: str) -
     except OSError:
         return
 
-    remove_headers = {
-        f"[marketplaces.{market_name}]",
-        f'[plugins."{plugin_id}@{market_name}"]',
-    }
+    remove_headers = {f'[plugins."{plugin_id}@{market_name}"]'}
+    if remove_marketplace:
+        remove_headers.add(f"[marketplaces.{market_name}]")
     kept: list[str] = []
     skipping = False
     for line in lines:
@@ -592,11 +711,14 @@ def uninstall(args: argparse.Namespace) -> None:
     target_root = Path(args.target_root).expanduser()
     codex_home = Path(args.codex_home).expanduser()
     paths = source_paths(project_root)
-    market_name = (
-        marketplace_name(paths["marketplace"])
-        if paths["marketplace"].exists()
-        else DEFAULT_MARKETPLACE_NAME
-    )
+    target_marketplace = target_root / ".agents" / "plugins" / "marketplace.json"
+    if target_marketplace.exists() or target_marketplace.is_symlink():
+        market_name = marketplace_name(target_marketplace)
+    elif paths["marketplace"].exists():
+        market_name = marketplace_name(paths["marketplace"])
+    else:
+        market_name = DEFAULT_MARKETPLACE_NAME
+    marketplace_has_other_plugins = target_marketplace_has_other_plugins(target_marketplace)
     selector_name = f"{PLUGIN_ID}@{market_name}"
     legacy_selector = f"{LEGACY_PLUGIN_ID}@{LEGACY_MARKETPLACE_NAME}"
 
@@ -608,7 +730,10 @@ def uninstall(args: argparse.Namespace) -> None:
                 codex_home,
                 allow_failure=True,
             )
-        for marketplace in dict.fromkeys((market_name, LEGACY_MARKETPLACE_NAME)):
+        marketplaces = [LEGACY_MARKETPLACE_NAME]
+        if not marketplace_has_other_plugins:
+            marketplaces.insert(0, market_name)
+        for marketplace in dict.fromkeys(marketplaces):
             run_command(
                 [codex, "plugin", "marketplace", "remove", marketplace],
                 codex_home,
@@ -633,7 +758,12 @@ def uninstall(args: argparse.Namespace) -> None:
             if path.exists() or path.is_symlink():
                 remove_path(path)
 
-    remove_config_sections(codex_home, PLUGIN_ID, market_name)
+    remove_config_sections(
+        codex_home,
+        PLUGIN_ID,
+        market_name,
+        remove_marketplace=not marketplace_has_other_plugins,
+    )
     remove_config_sections(codex_home, LEGACY_PLUGIN_ID, LEGACY_MARKETPLACE_NAME)
     print(f"Uninstalled {PRODUCT_NAME} from {target_root}.")
     print("Restart Codex to unload plugin hooks.")
