@@ -7,7 +7,14 @@ description: Use when the user wants Codex to automatically run a scope-aware re
 
 ## Workflow
 
-Use `$auto-review` to opt in. The plugin hook arms the session; do not manually submit the hook's review or fix prompts.
+Use `$auto-review` to opt in. A loaded UserPromptSubmit hook injects an `<auto_review_armed>` acknowledgement. When that acknowledgement is present, let the hook submit review and fix prompts; do not submit them manually.
+
+If the activating turn has no `<auto_review_armed>` acknowledgement, assume the task was created before the plugin was loaded and use this bounded inline fallback instead of silently waiting for a Stop hook:
+
+1. Complete the requested implementation, or inspect the current changes for a standalone review.
+2. Run one `discovery` review using the same scope and decision rules below.
+3. For `fix`, apply only the enumerated scoped fixes and run `closure`; permit at most two inline fix passes. Stop on a repeated finding, exhausted budget, or `needs_replan`.
+4. Prefix the final `auto_review_result` with `<!-- auto-review:inline-fallback -->`. If a hook is actually active, it consumes this result without scheduling a duplicate discovery pass.
 
 For an implementation task, include the marker in the task prompt:
 
@@ -25,7 +32,7 @@ $auto-review 检查一下
 $auto-review
 ```
 
-Perform a standalone review in the activating turn and return the structured result directly; the hook consumes it without scheduling a duplicate pass. If no structured result is returned, the Stop hook submits the discovery prompt as a fallback.
+When armed, perform a standalone review in the activating turn and return the structured result directly; the hook consumes it without scheduling a duplicate pass. If no structured result is returned, the Stop hook submits the discovery prompt as a fallback. When unarmed, follow the bounded inline fallback above instead of returning `action=fix` and expecting another turn.
 
 Use the nearest substantive task in the same session as the requirement basis. If it is unavailable, review only code-supported logic, regression, compatibility, security, and test problems; do not infer missing requirements. A clean worktree has no standalone review target, so the hook skips the loop.
 

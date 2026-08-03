@@ -20,7 +20,7 @@ SPEC.loader.exec_module(installer)
 
 
 def hooks_payload() -> dict:
-    command = 'python3 -c "auto_review_hook.py"'
+    command = 'python3 -X utf8 -c "auto_review_hook.py"'
     return {
         "hooks": {
             event_name: [
@@ -142,8 +142,8 @@ class HookPythonConfigurationTest(unittest.TestCase):
             )
             for event_name in installer.HOOK_EVENTS:
                 command = payload["hooks"][event_name][0]["hooks"][0]["command"]
-                self.assertTrue(command.startswith(f'"{executable}" -c '), command)
-                self.assertNotIn("python3 -c", command)
+                self.assertTrue(command.startswith(f'"{executable}" -X utf8 -c '), command)
+                self.assertNotIn("python3 -X utf8 -c", command)
 
     def test_posix_hook_shell_quotes_installer_python(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -160,7 +160,10 @@ class HookPythonConfigurationTest(unittest.TestCase):
                 (plugin_root / "hooks" / "hooks.json").read_text(encoding="utf-8")
             )
             command = payload["hooks"]["Stop"][0]["hooks"][0]["command"]
-            self.assertTrue(command.startswith("'/opt/Python Runtime/bin/python3' -c "), command)
+            self.assertTrue(
+                command.startswith("'/opt/Python Runtime/bin/python3' -X utf8 -c "),
+                command,
+            )
 
 
 class MarketplaceCompatibilityTest(unittest.TestCase):
@@ -325,7 +328,7 @@ class InstallPathSafetyTest(unittest.TestCase):
                 (plugin_dest / "hooks" / "hooks.json").read_text(encoding="utf-8")
             )
             command = configured["hooks"]["Stop"][0]["hooks"][0]["command"]
-            self.assertNotIn("python3 -c", command)
+            self.assertNotIn("python3 -X utf8 -c", command)
 
 
 if __name__ == "__main__":

@@ -15,10 +15,31 @@ from pathlib import Path
 from typing import Any
 
 
+def configure_utf8_stdio() -> None:
+    """Keep the Codex hook protocol UTF-8 even under a legacy Windows code page."""
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+
+
+configure_utf8_stdio()
+
+
 REVIEW_PROMPT = "review本次修改，检查是否存在遗漏，逻辑错误等问题"
 FIX_PROMPT = "修复这些问题然后重新做一次review"
 REVIEW_SENTINEL = "<!-- auto-review:review -->"
 FIX_SENTINEL = "<!-- auto-review:fix -->"
+INLINE_FALLBACK_SENTINEL = "<!-- auto-review:inline-fallback -->"
+ACTIVATION_TOKEN_RE = re.compile(
+    r"\$auto-review(?=\s|$|[^A-Za-z0-9_:-])",
+    re.IGNORECASE,
+)
+ACTIVATION_MARKDOWN_LINK_RE = re.compile(
+    r"\[\s*\$auto-review\s*\]\([^\r\n)]*\)",
+    re.IGNORECASE,
+)
 RESULT_RE = re.compile(
     r"<auto_review_result>\s*(\{.*?\})\s*</auto_review_result>",
     re.DOTALL,
@@ -393,16 +414,16 @@ def should_arm(prompt: str) -> bool:
         return False
     if REVIEW_SENTINEL in prompt or FIX_SENTINEL in prompt:
         return False
-    return bool(re.search(r"\$auto-review(?:\s|$|[^A-Za-z0-9_:-])", prompt, re.IGNORECASE))
+    return bool(ACTIVATION_TOKEN_RE.search(prompt))
+
+
+def strip_activation_reference(prompt: str) -> str:
+    text = ACTIVATION_MARKDOWN_LINK_RE.sub(" ", prompt or "")
+    return ACTIVATION_TOKEN_RE.sub(" ", text)
 
 
 def looks_like_inline_review_intent(prompt: str) -> bool:
-    text = re.sub(
-        r"\$auto-review(?=\s|$|[^A-Za-z0-9_:-])",
-        " ",
-        prompt or "",
-        flags=re.IGNORECASE,
-    )
+    text = strip_activation_reference(prompt)
     normalized = re.sub(r"\s+", " ", text).strip().lower()
     if not normalized:
         return False
@@ -436,12 +457,7 @@ def looks_like_inline_review_intent(prompt: str) -> bool:
 
 
 def prompt_without_activation(prompt: str) -> str:
-    text = re.sub(
-        r"\$auto-review(?=\s|$|[^A-Za-z0-9_:-])",
-        " ",
-        prompt or "",
-        flags=re.IGNORECASE,
-    )
+    text = strip_activation_reference(prompt)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -452,10 +468,21 @@ def looks_like_review_only_prompt(prompt: str) -> bool:
     normalized = body.lower()
     if re.search(r"^(?:please\s+)?(?:review|check|inspect|audit)\b", normalized):
         return True
-    if re.search(r"^(?:请|帮我|麻烦)?(?:检查|复查|审查|review)", body, re.IGNORECASE):
+    if re.search(
+        r"^(?:please\s+)?(?:(?:take\s+a\s+)?look\s+(?:at|for|over)\b|have\s+a\s+look\b)",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"^(?:(?:请|麻烦)?(?:帮我|帮忙)?)?"
+        r"(?:检查|复查|审查|review|看看|看下|看一下)",
+        body,
+        re.IGNORECASE,
+    ):
         return True
     change_intent = re.search(
-        r"\b(?:implement|fix|add|update|refactor|build)\b|实现|修复|新增|添加|修改|重构|开发",
+        r"\b(?:implement|fix|add|create|write|remove|delete|update|change|refactor|build)\b|"
+        r"实现|修复|新增|添加|创建|写入|删除|移除|更新|修改|重构|开发",
         normalized,
     )
     return not change_intent and looks_like_inline_review_intent(prompt)
@@ -938,7 +965,7 @@ def latest_goal_auto_review_request(payload: dict[str, Any]) -> tuple[bool, str]
 
 
 def transcript_has_auto_review_activity(payload: dict[str, Any], start_index: int = 0) -> bool:
-    needles = (REVIEW_SENTINEL, FIX_SENTINEL)
+    needles = (REVIEW_SENTINEL, FIX_SENTINEL, INLINE_FALLBACK_SENTINEL)
     records = transcript_records(payload)
     for record in records[max(0, start_index) :]:
         text = text_from_record(record)
@@ -1287,6 +1314,11 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
                 "prompt_prefix": prompt[:160],
             }
         )
+        print(
+            "<auto_review_armed>"
+            "Stop hook loaded for this goal. Auto-review will start after the goal is complete."
+            "</auto_review_armed>"
+        )
         return 0
 
     if not arm_requested:
@@ -1557,10 +1589,12 @@ def handle_inline_review_result_if_present(
     state: dict[str, Any],
     source: str,
 ) -> int | None:
-    if not state.get("activation_allows_inline_review_result"):
-        return None
-
     text = last_assistant_text(payload)
+    if (
+        not state.get("activation_allows_inline_review_result")
+        and INLINE_FALLBACK_SENTINEL not in text
+    ):
+        return None
     if "<auto_review_result" not in text:
         return None
     result = parse_review_result(text)

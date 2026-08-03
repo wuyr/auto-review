@@ -27,7 +27,7 @@ LEGACY_PLUGIN_ID = "auto-review"
 LEGACY_MARKETPLACE_NAME = "auto-review-local"
 OWNED_PLUGIN_IDS = frozenset((PLUGIN_ID, LEGACY_PLUGIN_ID))
 HOOK_EVENTS = ("UserPromptSubmit", "Stop")
-HOOK_PYTHON_PREFIX = "python3 -c "
+HOOK_PYTHON_PREFIX = "python3 -X utf8 -c "
 
 
 def fail(message: str) -> None:
@@ -227,7 +227,9 @@ def configure_hook_python(
                         "auto-review hook command must start with "
                         f"{HOOK_PYTHON_PREFIX!r}: {hooks_path}"
                     )
-                hook["command"] = command_prefix + " -c " + command[len(HOOK_PYTHON_PREFIX) :]
+                hook["command"] = (
+                    command_prefix + " -X utf8 -c " + command[len(HOOK_PYTHON_PREFIX) :]
+                )
                 configured += 1
 
     if configured < len(HOOK_EVENTS):
@@ -648,7 +650,9 @@ def install(args: argparse.Namespace) -> None:
     print(f"Plugin selector: {selector_name}")
     print(f"Hook trust: {codex_home / 'config.toml'}")
     print(f"Skill: {codex_home / 'skills' / SKILL_NAME}")
-    print("Restart Codex, then use: $auto-review <your task>")
+    print("Fully quit and restart Codex, then start a new task.")
+    print("Existing tasks keep their previous hook set and cannot load this update.")
+    print("Use: $auto-review <your task>")
 
 
 def remove_marketplace_entry(target_root: Path, keep_files: bool) -> None:

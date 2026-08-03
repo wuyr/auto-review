@@ -22,23 +22,64 @@ REVIEW_PROMPT = "review本次修改，检查是否存在遗漏，逻辑错误等
 FIX_PROMPT = "修复这些问题然后重新做一次review"
 REVIEW_SENTINEL = "<!-- auto-review:review -->"
 FIX_SENTINEL = "<!-- auto-review:fix -->"
+INLINE_FALLBACK_SENTINEL = "<!-- auto-review:inline-fallback -->"
 PROPOSED_PLAN = "<proposed_plan>\n1. Inspect the code.\n2. Implement the fix.\n</proposed_plan>"
 
 
 def local_hook_command(event_name: str) -> str:
     config = json.loads(HOOKS_CONFIG.read_text(encoding="utf-8"))
     command = config["hooks"][event_name][0]["hooks"][0]["command"]
-    if not command.startswith("python3 -c "):
+    if not command.startswith("python3 -X utf8 -c "):
         raise AssertionError(f"Unexpected hook command: {command}")
     executable = (
         subprocess.list2cmdline([sys.executable])
         if os.name == "nt"
         else shlex.quote(sys.executable)
     )
-    return executable + " -c " + command[len("python3 -c ") :]
+    return executable + " -X utf8 -c " + command[len("python3 -X utf8 -c ") :]
 
 
 class AutoReviewHookTest(unittest.TestCase):
+    def test_hook_protocol_forces_utf8_under_legacy_windows_code_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            env = os.environ.copy()
+            env["AUTO_REVIEW_STATE_HOME"] = str(state_home)
+            env["PYTHONUTF8"] = "0"
+            env["PYTHONIOENCODING"] = "cp936"
+
+            activation_prompt = "$auto-review 检查当前修改"
+            payload = self.base_payload("UserPromptSubmit", state_home)
+            payload["prompt"] = activation_prompt
+            armed = subprocess.run(
+                [sys.executable, str(HOOK)],
+                input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(armed.returncode, 0, armed.stderr.decode("utf-8"))
+
+            state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
+            self.assertEqual(
+                state["activation_prompt_sha256"],
+                hashlib.sha256(activation_prompt.encode("utf-8")).hexdigest(),
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            stopped = subprocess.run(
+                [sys.executable, str(HOOK)],
+                input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(stopped.returncode, 0, stopped.stderr.decode("utf-8"))
+            raw_output = stopped.stdout
+            self.assertNotIn(b"\xef\xbf\xbd", raw_output)
+            block = json.loads(raw_output.decode("utf-8"))
+            self.assertTrue(block["reason"].startswith(REVIEW_PROMPT))
+
     def test_bootstrap_falls_back_when_loaded_cache_root_was_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -370,8 +411,38 @@ class AutoReviewHookTest(unittest.TestCase):
             ("$auto-review", "existing_changes", True),
             ("$auto-review 检查一下", "existing_changes", True),
             ("$auto-review review the current diff", "existing_changes", True),
+            ("$auto-review 帮忙看看删除文件的逻辑有没有坑", "existing_changes", True),
+            ("$auto-review 看看更新机制有没有坑", "existing_changes", True),
+            (
+                "$auto-review please take a look for regression in the remove flow",
+                "existing_changes",
+                True,
+            ),
+            (
+                r"[$auto-review](C:\Users\tester\.codex\skills\auto-review\SKILL.md)",
+                "existing_changes",
+                True,
+            ),
+            (
+                r"[$auto-review](C:\Users\tester\.codex\skills\auto-review\SKILL.md) 检查一下",
+                "existing_changes",
+                True,
+            ),
             ("$auto-review 修复检查按钮", "task_changes", False),
             ("$auto-review implement the checker", "task_changes", False),
+            ("$auto-review create a result file", "task_changes", False),
+            ("$auto-review 帮我删除 review hook", "task_changes", False),
+            ("$auto-review create a review report", "task_changes", False),
+            (
+                r"[$auto-review](C:\Users\tester\.codex\skills\auto-review\SKILL.md) 修复检查按钮",
+                "task_changes",
+                False,
+            ),
+            (
+                r"[$auto-review](C:\Users\tester\.codex\skills\auto-review\SKILL.md) create a result file",
+                "task_changes",
+                False,
+            ),
         )
         for index, (prompt, target_mode, allows_inline) in enumerate(cases):
             with self.subTest(prompt=prompt), tempfile.TemporaryDirectory() as temp:
@@ -671,6 +742,27 @@ class AutoReviewHookTest(unittest.TestCase):
             state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
             self.assertEqual(state["phase"], "reviewing")
             self.assertEqual(state["review_count"], 1)
+
+    def test_inline_fallback_result_is_consumed_for_implementation_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            self.arm_session(state_home)
+            transcript = self.transcript(
+                state_home,
+                INLINE_FALLBACK_SENTINEL + self.action_result("clean"),
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
+
+            events = self.history_events(state_home)
+            self.assertEqual(events[-2]["event"], "inline_review_result")
+            self.assertEqual(events[-1]["event"], "review_clean")
+            self.assertEqual(events[-1]["source"], "armed_inline_review")
 
     def test_stale_completed_goal_does_not_suppress_later_armed_review(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1399,7 +1491,7 @@ class AutoReviewHookTest(unittest.TestCase):
             payload["prompt"] = "/goal $auto-review 实现这个目标，完成后自动 review。"
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "")
+            self.assertIn("auto_review_armed", result.stdout)
             self.assertFalse(self.state_file(state_home).exists())
 
             transcript = self.write_transcript(
@@ -1448,9 +1540,30 @@ class AutoReviewHookTest(unittest.TestCase):
             payload["prompt"] = "/goal $auto-review 实现新的目标，完成后自动 review。"
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "")
+            self.assertIn("auto_review_armed", result.stdout)
             self.assertFalse(self.state_file(state_home).exists())
             self.assertEqual(self.handoff_files(state_home), [])
+
+    def test_goal_inline_fallback_after_completion_does_not_schedule_duplicate_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state_home = Path(temp)
+            transcript = self.write_transcript(
+                state_home,
+                [
+                    self.goal_context_record("$auto-review 实现这个目标。"),
+                    self.goal_complete_record("complete"),
+                    self.agent_message_record(
+                        INLINE_FALLBACK_SENTINEL + self.action_result("clean")
+                    ),
+                ],
+            )
+
+            payload = self.base_payload("Stop", state_home)
+            payload["transcript_path"] = str(transcript)
+            result = self.run_hook(payload, state_home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(self.state_file(state_home).exists())
 
     def test_goal_active_waits_even_with_deferred_plan_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
