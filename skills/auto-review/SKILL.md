@@ -1,13 +1,13 @@
 ---
 name: auto-review
-description: Use when the user wants Codex to automatically run a scope-aware review of task changes or current uncommitted changes, apply proportionate fixes, and stop cleanly or request replanning when automatic repair would expand the task. Trigger with the explicit opt-in prompt "$auto-review".
+description: Use when the user wants Codex to automatically run a scope-aware review of task changes or current uncommitted changes, apply proportionate fixes, and stop cleanly or request replanning when automatic repair would expand the task. In the Auto Workflow plugin, trigger with the explicit opt-in prompt "$auto-workflow:auto-review"; the bundled hook also accepts legacy "$auto-review" prompts.
 ---
 
 # Auto Review
 
 ## Workflow
 
-Use `$auto-review` to opt in. A loaded UserPromptSubmit hook injects an `<auto_review_armed>` acknowledgement. When that acknowledgement is present, let the hook submit review and fix prompts; do not submit them manually.
+Use `$auto-workflow:auto-review` to opt in when this skill is bundled in the Auto Workflow plugin. The bundled hook also accepts `$auto-review` for existing prompts and prepared workflows. A loaded UserPromptSubmit hook injects an `<auto_review_armed>` acknowledgement. When that acknowledgement is present, let the hook submit review and fix prompts; do not submit them manually.
 
 If the activating turn has no `<auto_review_armed>` acknowledgement, assume the task was created before the plugin was loaded and use this bounded inline fallback instead of silently waiting for a Stop hook:
 
@@ -19,26 +19,26 @@ If the activating turn has no `<auto_review_armed>` acknowledgement, assume the 
 For an implementation task, include the marker in the task prompt:
 
 ```text
-$auto-review 按这个需求实现...
+$auto-workflow:auto-review 按这个需求实现...
 ```
 
 For a standalone review, either form reviews current uncommitted changes:
 
 ```text
-$auto-review 检查一下
+$auto-workflow:auto-review 检查一下
 ```
 
 ```text
-$auto-review
+$auto-workflow:auto-review
 ```
 
 When armed, perform a standalone review in the activating turn and return the structured result directly; the hook consumes it without scheduling a duplicate pass. If no structured result is returned, the Stop hook submits the discovery prompt as a fallback. When unarmed, follow the bounded inline fallback above instead of returning `action=fix` and expecting another turn.
 
 Use the nearest substantive task in the same session as the requirement basis. If it is unavailable, review only code-supported logic, regression, compatibility, security, and test problems; do not infer missing requirements. A clean worktree has no standalone review target, so the hook skips the loop.
 
-For `/plan`, put `$auto-review` in the initial planning request. The hook defers review when the plan output contains `<proposed_plan>`, then reviews the implementation after the user starts it. A cwd-scoped handoff preserves this intent when implementation starts in a new session. An unrelated prompt in the originating session cancels the deferred state.
+For `/plan`, put `$auto-workflow:auto-review` in the initial planning request. The hook defers review when the plan output contains `<proposed_plan>`, then reviews the implementation after the user starts it. A cwd-scoped handoff preserves this intent when implementation starts in a new session. An unrelated prompt in the originating session cancels the deferred state.
 
-For `/goal`, include `$auto-review` in the objective. Do not review intermediate continuation turns; start after the goal is marked `complete`.
+For `/goal`, include `$auto-workflow:auto-review` in the objective. Do not review intermediate continuation turns; start after the goal is marked `complete`.
 
 ## Review Target and Authority
 
@@ -107,4 +107,4 @@ The hook accepts the legacy `issues_found` result for in-flight compatibility, b
 
 ## Recursion Guard
 
-Do not invoke `$auto-review` inside automatic review or fix prompts. Internal sentinels prevent recursive arming.
+Do not invoke `$auto-workflow:auto-review` or its legacy alias inside automatic review or fix prompts. Internal sentinels prevent recursive arming.

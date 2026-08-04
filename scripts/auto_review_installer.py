@@ -652,7 +652,11 @@ def install(args: argparse.Namespace) -> None:
     print(f"Skill: {codex_home / 'skills' / SKILL_NAME}")
     print("Fully quit and restart Codex, then start a new task.")
     print("Existing tasks keep their previous hook set and cannot load this update.")
-    print("Use: $auto-review <your task>")
+    print("Use standalone: $auto-review <your task>")
+    print(
+        "When bundled by Auto Workflow, use: "
+        "$auto-workflow:auto-review <your task>"
+    )
 
 
 def remove_marketplace_entry(target_root: Path, keep_files: bool) -> None:

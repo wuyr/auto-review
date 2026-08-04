@@ -1,4 +1,4 @@
 interface:
   display_name: "Auto Review"
   short_description: "Review task changes, repair scoped issues, and pause safely."
-  default_prompt: "Use $auto-review to implement this task and review the resulting changes."
+  default_prompt: "Use $auto-workflow:auto-review to implement this task and review the resulting changes."

@@ -7,23 +7,27 @@
 ## 使用方式
 
 为避免不必要的review，本skill不会自动触发，必须**显式**启用。
-跟其他skill一样，在prompt中加入`$auto-review` 即可，例如：
+作为 Auto Workflow Plugin 的 bundled skill，规范入口是
+`$auto-workflow:auto-review`，例如：
 
 ```text
-$auto-review 修复xxx问题
+$auto-workflow:auto-review 修复xxx问题
 ```
 
 ```text
-$auto-review 新增xxx功能
+$auto-workflow:auto-review 新增xxx功能
 ```
 
 也可以只输入：
 
 ```text
-$auto-review
+$auto-workflow:auto-review
 ```
 
 这个用法会优先review当前会话最近的实质修改任务。
+
+为兼容已有 prompt 和 prepared workflow，bundled hook 仍接受旧入口
+`$auto-review`；新文档和新 workflow 应使用完整名。
 
 skill已适配 `/plan` 和 `/goal` 。
 
@@ -39,6 +43,9 @@ skill已适配 `/plan` 和 `/goal` 。
 
 
 ## 安装
+
+本节保留独立安装方式；独立安装后的 Skill 名仍是 `$auto-review`。团队通过
+Auto Workflow Plugin 安装时使用前文的完整名 `$auto-workflow:auto-review`。
 
 ### MacOS / Linux
 
