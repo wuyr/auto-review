@@ -6,28 +6,23 @@ As the name suggests, when you use this skill in a prompt that modifies files, C
 
 To avoid unnecessary reviews, this skill does not trigger automatically. You must enable it explicitly.
 
-When bundled in the Auto Workflow plugin, use the canonical
-`$auto-workflow:auto-review` name, for example:
+Like other skills, add `$auto-review` to your prompt, for example:
 
 ```text
-$auto-workflow:auto-review Fix the xxx issue
+$auto-review Fix the xxx issue
 ```
 
 ```text
-$auto-workflow:auto-review Add the xxx feature
+$auto-review Add the xxx feature
 ```
 
 Or simply use:
 
 ```text
-$auto-workflow:auto-review
+$auto-review
 ```
 
 This form first reviews the most recent substantive task involving file changes in the current session.
-
-For compatibility with existing prompts and prepared workflows, the bundled hook
-still accepts `$auto-review`. New documentation and workflows should use the
-fully qualified name.
 
 The skill supports `/plan`, `/goal`.
 
@@ -41,10 +36,6 @@ In the **goal** mode, the hook waits until the goal is marked `complete`, then s
 - Python 3.10 or newer is installed.
 
 ## Installation
-
-This section documents the standalone installation. Its skill name remains
-`$auto-review`; team installations through the Auto Workflow plugin use the
-fully qualified `$auto-workflow:auto-review` name shown above.
 
 ### macOS / Linux
 

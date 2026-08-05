@@ -32,16 +32,12 @@ FIX_PROMPT = "修复这些问题然后重新做一次review"
 REVIEW_SENTINEL = "<!-- auto-review:review -->"
 FIX_SENTINEL = "<!-- auto-review:fix -->"
 INLINE_FALLBACK_SENTINEL = "<!-- auto-review:inline-fallback -->"
-CANONICAL_ACTIVATION_TOKEN = "$auto-workflow:auto-review"
-LEGACY_ACTIVATION_TOKEN = "$auto-review"
 ACTIVATION_TOKEN_RE = re.compile(
-    rf"(?:{re.escape(CANONICAL_ACTIVATION_TOKEN)}|"
-    rf"{re.escape(LEGACY_ACTIVATION_TOKEN)})(?=\s|$|[^A-Za-z0-9_:-])",
+    r"\$auto-review(?=\s|$|[^A-Za-z0-9_:-])",
     re.IGNORECASE,
 )
 ACTIVATION_MARKDOWN_LINK_RE = re.compile(
-    rf"\[\s*(?:{re.escape(CANONICAL_ACTIVATION_TOKEN)}|"
-    rf"{re.escape(LEGACY_ACTIVATION_TOKEN)})\s*\]\([^\r\n)]*\)",
+    r"\[\s*\$auto-review\s*\]\([^\r\n)]*\)",
     re.IGNORECASE,
 )
 RESULT_RE = re.compile(
@@ -1052,10 +1048,7 @@ def review_prompt(
             "若找不到原始需求，只审代码可证实的逻辑、回归、兼容性、安全和测试问题，不推测需求遗漏；"
         )
     else:
-        target_note = (
-            f"目标是激活 {CANONICAL_ACTIVATION_TOKEN} 的任务所产生的修改，"
-            "以原始请求和修改前仓库合同为依据；"
-        )
+        target_note = "目标是激活 $auto-review 的任务所产生的修改，以原始请求和修改前仓库合同为依据；"
 
     summaries = [str(issue.get("summary") or "") for issue in previous_issues or []]
     if stage == REVIEW_STAGE_CLOSURE:

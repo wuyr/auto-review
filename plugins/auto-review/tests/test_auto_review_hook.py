@@ -23,8 +23,6 @@ FIX_PROMPT = "修复这些问题然后重新做一次review"
 REVIEW_SENTINEL = "<!-- auto-review:review -->"
 FIX_SENTINEL = "<!-- auto-review:fix -->"
 INLINE_FALLBACK_SENTINEL = "<!-- auto-review:inline-fallback -->"
-CANONICAL_ACTIVATION = "$auto-workflow:auto-review"
-LEGACY_ACTIVATION = "$auto-review"
 PROPOSED_PLAN = "<proposed_plan>\n1. Inspect the code.\n2. Implement the fix.\n</proposed_plan>"
 
 
@@ -50,7 +48,7 @@ class AutoReviewHookTest(unittest.TestCase):
             env["PYTHONUTF8"] = "0"
             env["PYTHONIOENCODING"] = "cp936"
 
-            activation_prompt = f"{CANONICAL_ACTIVATION} 检查当前修改"
+            activation_prompt = "$auto-review 检查当前修改"
             payload = self.base_payload("UserPromptSubmit", state_home)
             payload["prompt"] = activation_prompt
             armed = subprocess.run(
@@ -97,7 +95,7 @@ class AutoReviewHookTest(unittest.TestCase):
                 "hook_event_name": "UserPromptSubmit",
                 "session_id": "stale-cache-session",
                 "cwd": str(workspace),
-                "prompt": f"{CANONICAL_ACTIVATION} check current changes",
+                "prompt": "$auto-review check current changes",
             }
             env = os.environ.copy()
             env["CODEX_HOME"] = str(root / "codex-home")
@@ -328,7 +326,7 @@ class AutoReviewHookTest(unittest.TestCase):
 
     def arm_session(self, state_home: Path) -> None:
         payload = self.base_payload("UserPromptSubmit", state_home)
-        payload["prompt"] = f"{CANONICAL_ACTIVATION} implement the task"
+        payload["prompt"] = "$auto-review implement the task"
         result = self.run_hook(payload, state_home)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("auto_review_armed", result.stdout)
@@ -369,7 +367,7 @@ class AutoReviewHookTest(unittest.TestCase):
             + "</auto_review_result>"
         )
 
-    def test_unrelated_namespaced_activation_does_not_arm(self) -> None:
+    def test_namespaced_activation_does_not_arm(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             state_home = Path(temp)
             payload = self.base_payload("UserPromptSubmit", state_home)
@@ -378,18 +376,6 @@ class AutoReviewHookTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")
             self.assertFalse(self.state_file(state_home).exists())
-
-    def test_legacy_activation_remains_supported(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            state_home = Path(temp)
-            payload = self.base_payload("UserPromptSubmit", state_home)
-            payload["prompt"] = f"{LEGACY_ACTIVATION} implement the task"
-
-            result = self.run_hook(payload, state_home)
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("auto_review_armed", result.stdout)
-            self.assertTrue(self.state_file(state_home).exists())
 
     def enter_review_phase(self, state_home: Path) -> dict:
         self.arm_session(state_home)
@@ -422,8 +408,6 @@ class AutoReviewHookTest(unittest.TestCase):
 
     def test_activation_classifies_review_only_and_task_prompts(self) -> None:
         cases = (
-            (CANONICAL_ACTIVATION, "existing_changes", True),
-            (f"{CANONICAL_ACTIVATION} 检查一下", "existing_changes", True),
             ("$auto-review", "existing_changes", True),
             ("$auto-review 检查一下", "existing_changes", True),
             ("$auto-review review the current diff", "existing_changes", True),
@@ -445,7 +429,6 @@ class AutoReviewHookTest(unittest.TestCase):
                 True,
             ),
             ("$auto-review 修复检查按钮", "task_changes", False),
-            (f"{CANONICAL_ACTIVATION} 修复检查按钮", "task_changes", False),
             ("$auto-review implement the checker", "task_changes", False),
             ("$auto-review create a result file", "task_changes", False),
             ("$auto-review 帮我删除 review hook", "task_changes", False),
@@ -546,10 +529,7 @@ class AutoReviewHookTest(unittest.TestCase):
             result = self.run_hook(payload, state_home, cwd=workspace)
             self.assertEqual(result.returncode, 0, result.stderr)
             block = json.loads(result.stdout)
-            self.assertIn(
-                f"激活 {CANONICAL_ACTIVATION} 的任务所产生的修改",
-                block["reason"],
-            )
+            self.assertIn("激活 $auto-review 的任务所产生的修改", block["reason"])
             state = json.loads(self.state_file(state_home).read_text(encoding="utf-8"))
             self.assertEqual(state["review_target_mode"], "task_changes")
 
@@ -1508,9 +1488,7 @@ class AutoReviewHookTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             state_home = Path(temp)
             payload = self.base_payload("UserPromptSubmit", state_home)
-            payload["prompt"] = (
-                f"/goal {CANONICAL_ACTIVATION} 实现这个目标，完成后自动 review。"
-            )
+            payload["prompt"] = "/goal $auto-review 实现这个目标，完成后自动 review。"
             result = self.run_hook(payload, state_home)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("auto_review_armed", result.stdout)
@@ -1519,9 +1497,7 @@ class AutoReviewHookTest(unittest.TestCase):
             transcript = self.write_transcript(
                 state_home,
                 [
-                    self.goal_context_record(
-                        f"实现这个目标，完成后自动触发 {CANONICAL_ACTIVATION}。"
-                    ),
+                    self.goal_context_record("实现这个目标，完成后自动触发 $auto-review。"),
                     self.goal_complete_record("active"),
                 ],
             )
@@ -1535,9 +1511,7 @@ class AutoReviewHookTest(unittest.TestCase):
             transcript = self.write_transcript(
                 state_home,
                 [
-                    self.goal_context_record(
-                        f"实现这个目标，完成后自动触发 {CANONICAL_ACTIVATION}。"
-                    ),
+                    self.goal_context_record("实现这个目标，完成后自动触发 $auto-review。"),
                     self.goal_complete_record("complete"),
                 ],
             )
